@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,6 +34,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from hermes_cli.auth_constants import AuthError
 
 
 @pytest.fixture
@@ -1075,6 +1077,30 @@ def test_invalid_reviewer_route_blocks_immediately_with_terminal_fail(kanban_hom
         assert run["last_activity_at"]
 
 
+def test_production_route_resolver_classifies_terminal_auth_config_as_deterministic(
+    kanban_home: Path,
+) -> None:
+    """Unknown/missing provider configuration must fail before bounded retry."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="invalid production route", assignee="reviewer")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        with (
+            patch("gateway.run._profile_runtime_scope", return_value=nullcontext()),
+            patch("hermes_cli.profiles.get_profile_dir", return_value=kanban_home),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"model": {"default": "gpt-5.6-codex", "provider": "invalid_provider"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=AuthError("Unknown provider 'invalid_provider'.", code="invalid_provider"),
+            ),
+        ):
+            with pytest.raises(kbd.DeterministicRoutingError, match="invalid_provider"):
+                kbd._resolve_dispatch_route(task, "review")
+
+
 def test_transient_reviewer_route_failure_requeues_and_recovers(kanban_home: Path) -> None:
     """A temporary resolver outage must not sticky-block the review conveyor."""
     route = kbd.DispatchRoute(
@@ -1092,7 +1118,12 @@ def test_transient_reviewer_route_failure_requeues_and_recovers(kanban_home: Pat
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise TimeoutError("temporary token refresh timeout")
+            raise AuthError(
+                "temporary authentication service unavailable",
+                provider="openai-codex",
+                code="token_refresh_timeout",
+                retryable=True,
+            )
         return route
 
     with kbc.connect() as conn:

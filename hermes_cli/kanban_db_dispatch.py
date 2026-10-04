@@ -126,6 +126,7 @@ def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
     on the product card are deliberately ignored.
     """
     from gateway.run import _profile_runtime_scope
+    from hermes_cli.auth_constants import AuthError
     from hermes_cli.config import load_config_readonly
     from hermes_cli.profiles import get_profile_dir
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -154,10 +155,21 @@ def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
                 requested=requested_provider,
                 target_model=requested_model,
             )
+        except AuthError as exc:
+            # Resolution-time auth refusals are terminal configuration defects
+            # unless the raiser explicitly identifies a recoverable transport or
+            # refresh condition. AuthError.retryable=None is documented as
+            # terminal for auth refusals.
+            if exc.retryable is True:
+                raise
+            raise DeterministicRoutingError(
+                f"{role} route {profile!r} -> {requested_provider!r} -> "
+                f"{requested_model!r} is invalid: {exc}"
+            ) from exc
         except ValueError as exc:
-            # Unknown providers, unsupported models, and malformed configuration
-            # are deterministic. Transport, token-refresh, lock, and I/O errors
-            # are deliberately allowed to propagate for bounded retry.
+            # Disabled providers and malformed static configuration are
+            # deterministic. Transport, token-refresh, lock, and I/O errors are
+            # deliberately allowed to propagate for bounded retry.
             raise DeterministicRoutingError(
                 f"{role} route {profile!r} -> {requested_provider!r} -> "
                 f"{requested_model!r} is invalid: {exc}"
@@ -1654,7 +1666,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
@@ -1681,7 +1693,11 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and latest_outcome not in {"crashed", "route_resolution_failed"}
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
