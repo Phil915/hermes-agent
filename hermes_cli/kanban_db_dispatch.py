@@ -154,7 +154,10 @@ def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
                 requested=requested_provider,
                 target_model=requested_model,
             )
-        except Exception as exc:
+        except ValueError as exc:
+            # Unknown providers, unsupported models, and malformed configuration
+            # are deterministic. Transport, token-refresh, lock, and I/O errors
+            # are deliberately allowed to propagate for bounded retry.
             raise DeterministicRoutingError(
                 f"{role} route {profile!r} -> {requested_provider!r} -> "
                 f"{requested_model!r} is invalid: {exc}"
@@ -186,12 +189,13 @@ def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
 def _declared_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
     """Non-I/O route seam for custom spawn functions used by embedders/tests."""
     role = "developer_reviewer" if lane == "review" else "worker"
+    review = lane == "review"
     return DispatchRoute(
         role=role,
         profile=str(task.assignee or ""),
-        provider=str(task.provider_override or "profile-default"),
+        provider="profile-default" if review else str(task.provider_override or "profile-default"),
         endpoint="profile-default",
-        model=str(task.model_override or "profile-default"),
+        model="profile-default" if review else str(task.model_override or "profile-default"),
         api_mode="profile-default",
     )
 
@@ -1979,7 +1983,7 @@ def observed_execution_state(conn: sqlite3.Connection, task: "Task") -> str:
     if task.current_run_id is None:
         return "orphaned"
     row = conn.execute(
-        "SELECT ended_at, worker_pid, worker_started_at, claim_lock, claim_expires "
+        "SELECT ended_at, worker_pid, worker_started_at, claim_lock, claim_expires, started_at "
         "FROM task_runs WHERE id = ? AND task_id = ?",
         (task.current_run_id, task.id),
     ).fetchone()
@@ -1988,6 +1992,12 @@ def observed_execution_state(conn: sqlite3.Connection, task: "Task") -> str:
     pid = row["worker_pid"]
     if pid is not None and str(row["claim_lock"] or "").startswith(_kb._host_prefix()):
         if not _worker_alive(int(pid), _kb._row_get(row, "worker_started_at")):
+            started_at = _kb._row_get(row, "started_at")
+            if (
+                started_at is not None
+                and time.time() - int(started_at) < _kb._resolve_crash_grace_seconds()
+            ):
+                return "starting"
             return "crashed"
     if row["claim_expires"] is not None and int(row["claim_expires"]) < int(time.time()):
         return "stale"
@@ -2223,12 +2233,21 @@ def _dispatch_lane_task(
             )
         dispatched = replace(
             claimed,
-            provider_override=route.provider,
-            model_override=route.model,
+            # A custom spawn seam without an explicit route resolver delegates
+            # to the reviewer's profile defaults; never forward card-level
+            # Worker overrides across the role boundary.
+            provider_override=(
+                None if lane == "review" and route.provider == "profile-default"
+                else route.provider
+            ),
+            model_override=(
+                None if lane == "review" and route.model == "profile-default"
+                else route.model
+            ),
         )
         with _kb.write_txn(conn):
             _record_dispatch_route(conn, claimed.id, route)
-    except Exception as exc:
+    except DeterministicRoutingError as exc:
         error = f"deterministic routing failure for {lane}: {exc}"
         if _record_task_failure(
             conn,
@@ -2238,7 +2257,24 @@ def _dispatch_lane_task(
             force_trip=True,
             release_claim=True,
             end_run=True,
-            event_payload_extra={"routing_failure": True, "lane": lane},
+            event_payload_extra={"routing_failure": True, "lane": lane, "deterministic": True},
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    except Exception as exc:
+        # Resolution can touch OAuth refresh, filesystem locks, and provider
+        # metadata. Those failures are recoverable and spend only the bounded
+        # retry budget; they must not create a sticky operator block.
+        error = f"transient route resolution failure for {lane}: {exc}"
+        if _record_task_failure(
+            conn,
+            claimed.id,
+            error,
+            outcome="route_resolution_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"routing_failure": True, "lane": lane, "deterministic": False},
         ):
             result.auto_blocked.append(claimed.id)
         return False

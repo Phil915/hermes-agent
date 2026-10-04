@@ -1968,6 +1968,7 @@ _TERMINAL_RESULT_BY_OUTCOME = {
     "changes_requested": "FAIL",
     "spawn_failed": "FAIL",
     "route_failed": "FAIL",
+    "route_resolution_failed": "CRASHED",
     "gave_up": "FAIL",
     "blocked": "BLOCKED",
     "dependency_wait": "BLOCKED",
@@ -1997,6 +1998,10 @@ def _end_run(
     terminal_result = _TERMINAL_RESULT_BY_OUTCOME.get(outcome, "FAIL")
     exit_reason = _first_line(error or summary or outcome, 500) or outcome
     last_activity_at = now
+    existing = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    durable_metadata = _json_dict(existing["metadata"] if existing else None)
+    if metadata:
+        durable_metadata.update(metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -2014,7 +2019,7 @@ def _end_run(
            AND ended_at IS NULL
         """,
         (
-            status or outcome, outcome, summary, error, _json_or_null(metadata),
+            status or outcome, outcome, summary, error, _json_or_null(durable_metadata),
             terminal_result, exit_reason, last_activity_at, now, run_id,
         ),
     )

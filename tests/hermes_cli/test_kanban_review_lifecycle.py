@@ -1007,6 +1007,35 @@ def test_review_dispatch_uses_reviewer_route_not_worker_overrides(kanban_home: P
         assert persisted.provider_override == "custom"
 
 
+def test_custom_spawn_clears_worker_overrides_on_review(kanban_home: Path) -> None:
+    """Embedders using a custom spawn function must not receive the Worker route."""
+    captured = []
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="custom review spawn",
+            assignee="sii-worker",
+            model_override="qwen38-27b-mtp-fullctx",
+            provider_override="custom",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: captured.append(task),
+                reconcile_orphans=False,
+            )
+        assert result.spawned and captured
+        assert captured[0].assignee == "reviewer"
+        assert captured[0].model_override is None
+        assert captured[0].provider_override is None
+
+
 def test_invalid_reviewer_route_blocks_immediately_with_terminal_fail(kanban_home: Path) -> None:
     """Invalid model/provider pairs are deterministic, not respawn candidates."""
     with kbc.connect() as conn:
@@ -1046,6 +1075,87 @@ def test_invalid_reviewer_route_blocks_immediately_with_terminal_fail(kanban_hom
         assert run["last_activity_at"]
 
 
+def test_transient_reviewer_route_failure_requeues_and_recovers(kanban_home: Path) -> None:
+    """A temporary resolver outage must not sticky-block the review conveyor."""
+    route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+    attempts = 0
+    spawned = []
+
+    def resolver(task, lane):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("temporary token refresh timeout")
+        return route
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="transient review route", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            first = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: spawned.append(task),
+                route_resolver=resolver,
+                reconcile_orphans=False,
+            )
+        assert first.auto_blocked == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "review"
+        assert task.current_run_id is None
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            second = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: spawned.append(task),
+                route_resolver=resolver,
+                reconcile_orphans=False,
+            )
+        assert second.spawned and spawned
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        runs = conn.execute(
+            "SELECT outcome, terminal_result FROM task_runs WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert any(
+            r["outcome"] == "route_resolution_failed" and r["terminal_result"] == "CRASHED"
+            for r in runs
+        )
+
+
+def test_observed_state_honors_worker_launch_grace(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="launch grace", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kbd._set_worker_pid(conn, tid, 999_999_999)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kbd.observed_execution_state(conn, task) == "starting"
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 31 WHERE id = ?",
+            (claimed.current_run_id,),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kbd.observed_execution_state(conn, task) == "crashed"
+
+
 def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1081,12 +1191,12 @@ def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
         assert review_run_id is not None
         # Reporting inspects the live run/PID instead of repeating the intended
         # persisted state (which is still "running" until reconciliation).
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         in_flight = kb.get_task(conn, tid)
         assert in_flight is not None
         assert in_flight.status == "running"
         assert kbd.observed_execution_state(conn, in_flight) == "crashed"
 
-        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
             second = kbd.dispatch_once(
                 conn,
@@ -1102,7 +1212,7 @@ def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
         assert task.current_run_id is None
 
         run = conn.execute(
-            "SELECT ended_at, terminal_result, exit_reason, last_activity_at "
+            "SELECT ended_at, terminal_result, exit_reason, last_activity_at, metadata "
             "FROM task_runs WHERE id = ?", (review_run_id,),
         ).fetchone()
         assert run["ended_at"] is not None
@@ -1110,3 +1220,6 @@ def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
         assert review_run_id
         assert run["exit_reason"]
         assert run["last_activity_at"]
+        metadata = json.loads(run["metadata"])
+        assert metadata["dispatch_route"] == reviewer_route.as_dict()
+        assert metadata["execution_id"] == review_run_id
