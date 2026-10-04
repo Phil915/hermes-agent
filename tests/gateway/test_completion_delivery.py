@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -741,6 +742,66 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
 
     asyncio.run(_exercise())
     adapter.handle_message.assert_awaited_once()
+
+
+def test_aged_secondary_completion_enters_delivery_consumer_exactly_once(
+    tmp_path, monkeypatch, isolated_registry,
+):
+    """A live-owner watchdog re-offer must be claimed in the event's profile ledger."""
+    from gateway.session import SessionSource
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation
+
+    secondary_home = tmp_path / "secondary"
+    now = time.time()
+    event = _async_event("deleg_aged_secondary")
+    event.update({
+        "session_key": "agent:secondary:telegram:dm:12345:678",
+        "origin_profile": "secondary",
+        "origin_hermes_home": str(secondary_home),
+        "dispatched_at": now - 2,
+        "completed_at": now - 1,
+    })
+    token = set_hermes_home_override(secondary_home)
+    try:
+        _persist_pending_completion(event)
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        eligible_at = time.time() + async_delegation._PENDING_DELIVERY_GRACE_S + 1
+        assert async_delegation.sweep_orphaned_completions(
+            isolated_registry.completion_queue, now=eligible_at,
+        ) == 1
+    finally:
+        reset_hermes_home_override(token)
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    # Persisted session-store origins can predate profile-aware sources.  The
+    # route resolver still knows which profile owns this event.
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", profile=None,
+    )
+    runner._resolve_profile_home_for_source = lambda source: secondary_home
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    token = set_hermes_home_override(secondary_home)
+    try:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        assert row["delivery_recovery_reason"] == "aged_pending_live_owner"
+        assert row["delivery_state"] == "delivered"
+        assert row["delivery_attempts"] == 1
+        assert row["delivered_at"] is not None
+        assert async_delegation.sweep_orphaned_completions(
+            isolated_registry.completion_queue,
+            now=eligible_at + async_delegation.ORPHAN_SWEEP_INTERVAL_S,
+        ) == 0
+    finally:
+        reset_hermes_home_override(token)
+    adapter.handle_message.assert_awaited_once()
+    assert isolated_registry.completion_queue.empty()
 
 
 # ---------------------------------------------------------------------------

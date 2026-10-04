@@ -1569,12 +1569,14 @@ class GatewayNotificationsMixin:
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
-        if source is None or not getattr(source, "profile", None):
-            # No routed profile: the launch profile's own completion. Bind ITS scope once the
-            # process multiplexes — unscoped, a fail-closed ledger read raises on a legitimate
-            # launch-profile event (no-op while single-profile).
+        if source is None:
+            # No routable source: the launch profile's own completion. Bind ITS
+            # scope once the process multiplexes (no-op while single-profile).
             from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
             return async_launch_profile_scope_if_multiplexed()
+        # A persisted origin may predate profile-aware SessionSource records.
+        # Resolve it anyway: _resolve_profile_home_for_source can recover the
+        # owning profile from the route before falling back to the launch profile.
         profile_home = self._resolve_profile_home_for_source(source)
         if get_hermes_home_override() == str(profile_home):
             return contextlib.nullcontext()  # already inside this profile's scope
