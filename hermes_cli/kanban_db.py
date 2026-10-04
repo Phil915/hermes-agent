@@ -796,6 +796,9 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    terminal_result: Optional[str] = None
+    exit_reason: Optional[str] = None
+    last_activity_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -810,6 +813,9 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
+            terminal_result=_lossy_text(_row_get(row, "terminal_result")),
+            exit_reason=_lossy_text(_row_get(row, "exit_reason")),
+            last_activity_at=_opt_int(_row_get(row, "last_activity_at")),
         )
 
 
@@ -1028,7 +1034,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Durable execution terminal envelope. execution_id is this row's id.
+    terminal_result     TEXT,
+    exit_reason         TEXT,
+    last_activity_at    INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1952,6 +1962,23 @@ def _append_event(
     )
 
 
+_TERMINAL_RESULT_BY_OUTCOME = {
+    "completed": "PASS",
+    "review_requested": "PASS",
+    "changes_requested": "FAIL",
+    "spawn_failed": "FAIL",
+    "route_failed": "FAIL",
+    "gave_up": "FAIL",
+    "blocked": "BLOCKED",
+    "dependency_wait": "BLOCKED",
+    "rate_limited": "BLOCKED",
+    "crashed": "CRASHED",
+    "timed_out": "CRASHED",
+    "reclaimed": "CRASHED",
+    "stale": "CRASHED",
+}
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -1967,6 +1994,9 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    terminal_result = _TERMINAL_RESULT_BY_OUTCOME.get(outcome, "FAIL")
+    exit_reason = _first_line(error or summary or outcome, 500) or outcome
+    last_activity_at = now
     conn.execute(
         """
         UPDATE task_runs
@@ -1975,12 +2005,18 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               terminal_result = ?,
+               exit_reason    = ?,
+               last_activity_at = ?,
                ended_at      = ?,
                claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (
+            status or outcome, outcome, summary, error, _json_or_null(metadata),
+            terminal_result, exit_reason, last_activity_at, now, run_id,
+        ),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
@@ -2060,18 +2096,22 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
+            terminal_result, exit_reason, last_activity_at,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key, outcome, outcome, summary, error, _json_or_null(metadata),
-            now, now,
+            _TERMINAL_RESULT_BY_OUTCOME.get(outcome, "FAIL"),
+            _first_line(error or summary or outcome, 500) or outcome,
+            now, now, now,
         ),
     )
     return int(cur.lastrowid or 0)
 
 
 # --- Dependency resolution (todo -> ready) ---
+
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when the newest ``blocked``/``unblocked``/``gave_up`` event says the

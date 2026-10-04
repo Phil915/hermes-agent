@@ -855,6 +855,9 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("terminal_result", "terminal_result TEXT"),
+    ("exit_reason", "exit_reason TEXT"),
+    ("last_activity_at", "last_activity_at INTEGER"),
 )
 
 
