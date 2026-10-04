@@ -118,6 +118,28 @@ class DispatchRoute:
 RouteResolver = Callable[["Task", str], DispatchRoute]
 
 
+_DETERMINISTIC_ROUTE_AUTH_CODES = frozenset({
+    "invalid_provider",
+    "missing_api_key",
+    "missing_base_url",
+})
+
+
+def _route_auth_error_is_deterministic(exc: Exception) -> bool:
+    """Classify only auth failures carrying terminal/configuration evidence.
+
+    ``AuthError.retryable=None`` is an unknown classification, not proof that a
+    later attempt cannot succeed.  Explicit retryability wins; otherwise a
+    relogin requirement or a route-configuration code is deterministic.
+    """
+    retryable = getattr(exc, "retryable", None)
+    if retryable is not None:
+        return not bool(retryable)
+    if bool(getattr(exc, "relogin_required", False)):
+        return True
+    return str(getattr(exc, "code", "") or "") in _DETERMINISTIC_ROUTE_AUTH_CODES
+
+
 def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
     """Resolve one role-owned profile route without cross-role inheritance.
 
@@ -156,11 +178,10 @@ def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
                 target_model=requested_model,
             )
         except AuthError as exc:
-            # Resolution-time auth refusals are terminal configuration defects
-            # unless the raiser explicitly identifies a recoverable transport or
-            # refresh condition. AuthError.retryable=None is documented as
-            # terminal for auth refusals.
-            if exc.retryable is True:
+            # Only explicit terminal/configuration evidence is sticky.  Legacy
+            # provider paths leave ``retryable`` unset for both terminal and
+            # transient failures, so None must remain recoverable.
+            if not _route_auth_error_is_deterministic(exc):
                 raise
             raise DeterministicRoutingError(
                 f"{role} route {profile!r} -> {requested_provider!r} -> "
@@ -1278,18 +1299,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, "
+            "       t.started_at, t.assignee, r.started_at AS run_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
+            # Launch-window grace belongs to this execution, not the card's
+            # first-ever start.  A review/retry run must receive a fresh window.
+            started_at = _kb._row_get(row, "run_started_at")
+            if started_at is None:
+                started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):

@@ -1101,6 +1101,52 @@ def test_production_route_resolver_classifies_terminal_auth_config_as_determinis
                 kbd._resolve_dispatch_route(task, "review")
 
 
+def test_production_codex_quota_without_retryable_hint_requeues(
+    kanban_home: Path,
+) -> None:
+    """A Codex quota result remains retryable even when legacy code omitted the hint."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="temporary Codex quota", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with (
+            patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True),
+            patch("gateway.run._profile_runtime_scope", return_value=nullcontext()),
+            patch("hermes_cli.profiles.get_profile_dir", return_value=kanban_home),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"model": {"default": "gpt-5.6-codex", "provider": "openai-codex"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=AuthError(
+                    "Codex provider quota exhausted (429). Credentials are still valid.",
+                    provider="openai-codex",
+                    code="codex_rate_limited",
+                ),
+            ),
+        ):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: None,
+                route_resolver=kbd._resolve_dispatch_route,
+            )
+
+        assert result.auto_blocked == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "review"
+        run = conn.execute(
+            "SELECT outcome, terminal_result FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "route_resolution_failed"
+        assert run["terminal_result"] == "CRASHED"
+
+
 def test_transient_reviewer_route_failure_requeues_and_recovers(kanban_home: Path) -> None:
     """A temporary resolver outage must not sticky-block the review conveyor."""
     route = kbd.DispatchRoute(
@@ -1185,6 +1231,49 @@ def test_observed_state_honors_worker_launch_grace(
         task = kb.get_task(conn, tid)
         assert task is not None
         assert kbd.observed_execution_state(conn, task) == "crashed"
+
+
+def test_crash_reconciliation_honors_current_run_launch_grace(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    dead_pid = 999_999_999
+    reviewer_route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="relaunched review grace", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        conn.execute("UPDATE tasks SET started_at = started_at - 3600 WHERE id = ?", (tid,))
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            dispatched = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: dead_pid,
+                route_resolver=lambda task, lane: reviewer_route,
+                reconcile_orphans=False,
+            )
+        assert dispatched.spawned
+        review_task = kb.get_task(conn, tid)
+        assert review_task is not None
+        review_run_id = review_task.current_run_id
+        assert review_run_id is not None
+
+        assert kbd.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == review_run_id
+        run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (review_run_id,)).fetchone()
+        assert run["ended_at"] is None
 
 
 def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
