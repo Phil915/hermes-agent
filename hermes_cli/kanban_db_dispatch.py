@@ -122,7 +122,16 @@ _DETERMINISTIC_ROUTE_AUTH_CODES = frozenset({
     "invalid_provider",
     "missing_api_key",
     "missing_base_url",
+    "missing_external_process_cli",
+    "no_aws_credentials",
 })
+_DETERMINISTIC_ROUTE_AUTH_PREFIXES = (
+    "No Anthropic credentials found.",
+    "No Azure Anthropic API key found.",
+    "Vertex AI credentials could not be resolved.",
+    "Azure Foundry requires an API key.",
+    "Azure Foundry requires a base URL.",
+)
 
 
 def _route_auth_error_is_deterministic(exc: Exception) -> bool:
@@ -137,7 +146,9 @@ def _route_auth_error_is_deterministic(exc: Exception) -> bool:
         return not bool(retryable)
     if bool(getattr(exc, "relogin_required", False)):
         return True
-    return str(getattr(exc, "code", "") or "") in _DETERMINISTIC_ROUTE_AUTH_CODES
+    if str(getattr(exc, "code", "") or "") in _DETERMINISTIC_ROUTE_AUTH_CODES:
+        return True
+    return str(exc).startswith(_DETERMINISTIC_ROUTE_AUTH_PREFIXES)
 
 
 def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:

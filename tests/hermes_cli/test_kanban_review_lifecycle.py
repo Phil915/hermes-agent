@@ -1101,6 +1101,29 @@ def test_production_route_resolver_classifies_terminal_auth_config_as_determinis
                 kbd._resolve_dispatch_route(task, "review")
 
 
+def test_route_auth_classifier_covers_known_configuration_failures() -> None:
+    deterministic = [
+        AuthError("No Anthropic credentials found."),
+        AuthError("No Azure Anthropic API key found."),
+        AuthError("Vertex AI credentials could not be resolved."),
+        AuthError("Azure Foundry requires an API key."),
+        AuthError("Azure Foundry requires a base URL."),
+        AuthError("No AWS credentials found for Bedrock.", code="no_aws_credentials"),
+        AuthError("Could not find the CLI command.", code="missing_external_process_cli"),
+    ]
+    assert all(kbd._route_auth_error_is_deterministic(exc) for exc in deterministic)
+    assert not kbd._route_auth_error_is_deterministic(
+        AuthError("Anthropic credentials are rate-limited for model.")
+    )
+    assert not kbd._route_auth_error_is_deterministic(
+        AuthError(
+            "No AWS credentials found for Bedrock.",
+            code="no_aws_credentials",
+            retryable=True,
+        )
+    )
+
+
 def test_production_codex_quota_without_retryable_hint_requeues(
     kanban_home: Path,
 ) -> None:
