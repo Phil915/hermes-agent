@@ -1268,9 +1268,19 @@ class GatewayNotificationsMixin:
                 return owner[0]
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return self.adapters.get(Platform.RELAY)
+        # A restored multiplexed source has no live transport-owner reference. Its persisted
+        # transport profile still identifies the adapter that received the lane; the source profile
+        # identifies the runtime/ledger and may be different (for example default bot -> SII).
+        from gateway.session_identity import identity_of
+        identity = identity_of(source) if source is not None else None
+        adapter_profile = (
+            identity.transport_profile
+            if identity is not None and identity.multiplexed and not identity.transport_inferred
+            else getattr(source, "profile", None)
+        )
         # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
         # shared-bot satellite; a disconnected secondary fails closed to ``{}``.
-        adapters = self._adapters_for_profile(getattr(source, "profile", None))
+        adapters = self._adapters_for_profile(adapter_profile)
         try:
             _transport = resolve_delivery_transport(Platform(platform_name), self.config, adapters)
         except Exception:
