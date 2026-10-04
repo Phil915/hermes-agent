@@ -51,13 +51,16 @@ _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _CLAIM_LEASE_S = 300.0
 _DB_LOCK = threading.Lock()
 
-# ── Orphaned-completion sweep ────────────────────────────────────────────────
-# Startup replay runs once per process, so a completion whose owner died while THIS process was
-# already running (a desktop reload) would wait for the next restart (#97202). Delivery loops (gateway
-# watcher, TUI poller) sweep each home they serve at most once per interval.
+# ── Pending-completion recovery sweep ────────────────────────────────────────
+# Startup replay runs once per process, so a completion whose normal queue delivery is missed must
+# be re-offered while the process stays alive. Delivery loops (gateway watcher, TUI poller) sweep
+# each home they serve at most once per interval. The durable consumer claim remains the race gate.
 ORPHAN_SWEEP_INTERVAL_S = 30.0
-# Idle time before a dead owner's pending row is re-offered; keeps the sweep off a row just touched.
-_ORPHAN_STALE_S = 60.0
+# Grace for normal immediate delivery before a terminal pending result is re-offered. This applies
+# whether the recorded owner is alive or dead; owner liveness only determines the audit reason.
+_PENDING_DELIVERY_GRACE_S = 60.0
+# Compatibility name retained for existing orphan-recovery callers/tests.
+_ORPHAN_STALE_S = _PENDING_DELIVERY_GRACE_S
 _orphan_lock = threading.Lock()
 # (home key, delegation_id) put on this process's queue by replay or sweep and not re-offered while
 # that copy is alive. A consumer that discards its copy with the row still pending hands it back
@@ -356,39 +359,40 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
 
 
 def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
-    """Offer this home's completions whose owner died after THIS process started (#97202).
+    """Re-offer aged durable completions that normal delivery did not settle.
 
-    Startup replay (``restore_undelivered_completions``) covers owners that died before the process
-    started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
-    ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
-    past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check. A row is offered once per live in-memory copy: a consumer that discards the copy with the row
-    still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
-    the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
-    the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
-    callers bind the owning profile first."""
+    Startup replay covers process restarts; this fallback runs while delivery loops remain alive. A
+    terminal row qualifies when it has both durable event/result payloads, remains pending beyond the
+    grace period, and has no live delivery claim. Owner liveness does not suppress recovery: it only
+    determines the durable audit reason. Consumers still atomically claim the event, so competing
+    sweepers may not process it twice. Rows beyond the retry/age budgets converge to ``dropped``.
+    Callers must bind the owning profile before invoking this function.
+    """
     alive = _owner_liveness()
-    if alive is None or not _db_path().exists():
+    if not _db_path().exists():
         return 0  # never create a ledger just to sweep it
     recover_abandoned_delegations()
     now = time.time() if now is None else now
     home = hermes_home_key(get_hermes_home())
-    with _orphan_lock:
-        offered = {delegation_id for key, delegation_id in _offered if key == home}
     with _DB_LOCK, _transaction() as conn:
+        # Read this set while holding the DB lock too: concurrent recovery threads must not both
+        # snapshot it empty and enqueue duplicate in-process offers before either consumer claims.
+        with _orphan_lock:
+            offered = {delegation_id for key, delegation_id in _offered if key == home}
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
                       owner_pid, owner_started_at, delivery_attempts
                FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                 AND event_json IS NOT NULL AND updated_at < ?
+                 AND event_json IS NOT NULL AND result_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
-               ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
-        orphans = []
+               ORDER BY completed_at, delegation_id""",
+            (now - _PENDING_DELIVERY_GRACE_S, now - _CLAIM_LEASE_S),
+        ).fetchall()
+        recoverable = []
         for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
-            if delegation_id in offered or alive(pid, started):
+            if delegation_id in offered:
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
-                # Its last claimant died holding the final attempt; converge like release_completion_delivery.
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                               delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
@@ -396,8 +400,16 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                                "marking terminally dropped (result remains queryable).",
                                delegation_id, _MAX_DELIVERY_ATTEMPTS)
                 continue
-            orphans.append((delegation_id, payload, completed_at, dispatched_at))
-        return _replay_pending(conn, orphans, target_queue, now)
+            owner_alive = bool(alive and alive(pid, started))
+            reason = "aged_pending_live_owner" if owner_alive else "aged_pending_orphan"
+            conn.execute("""UPDATE async_delegations SET delivery_recovery_reason=?
+                       WHERE delegation_id=? AND delivery_state='pending'""", (reason, delegation_id))
+            evt = json.loads(payload)
+            if isinstance(evt, dict):
+                evt["delivery_recovery_reason"] = reason
+                payload = json.dumps(evt)
+            recoverable.append((delegation_id, payload, completed_at, dispatched_at))
+        return _replay_pending(conn, recoverable, target_queue, now)
 
 
 def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
@@ -440,10 +452,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         if row is None:
             return True  # legacy event created before durable dispatch
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
-                      delivery_attempts=delivery_attempts+1, updated_at=?
+                      last_delivery_claimed_at=?, delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
+            (claim_id, now, now, now, delegation_id, now - _CLAIM_LEASE_S))
         return cur.rowcount == 1
 
 
@@ -550,13 +562,14 @@ def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      result_json, delivery_state, delivery_attempts, origin_session_id,
+                      delivered_at, last_delivery_claimed_at, delivery_recovery_reason
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
     return None if row is None else {
         "delegation_id": delegation_id, "origin_session": row[0], "state": row[1], "dispatched_at": row[2],
         "completed_at": row[3], "result": json.loads(row[4]) if row[4] else None, "delivery_state": row[5],
-        "delivery_attempts": row[6], "origin_session_id": row[7] or ""}
+        "delivery_attempts": row[6], "origin_session_id": row[7] or "", "delivered_at": row[8],
+        "last_delivery_claimed_at": row[9], "delivery_recovery_reason": row[10]}
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
