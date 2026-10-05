@@ -166,7 +166,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
-BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
+BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "needs_direction", "blocked", "review", "done"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -550,6 +550,15 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+_DIRECTION_STATUS_MSG = (
+    "NEEDS_DIRECTION requires a Worker question and Developer response; "
+    "answer the existing question with kanban_answer_direction to resume the same Worker.")
+
+
+def _guard_direction_status(conn, task_id: str, status: str) -> None:
+    current = kanban_db.get_task(conn, task_id)
+    if status == "needs_direction" or (current and current.status == "needs_direction"):
+        raise _StatusRejected(_DIRECTION_STATUS_MSG)
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -582,6 +591,7 @@ _STATUS_HANDLERS: dict[str, Any] = {
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     """Dispatch a status verb; raises ``_StatusRejected`` (user-facing message)
     for ``running`` or an unknown status (``unknown_detail``)."""
+    _guard_direction_status(conn, task_id, s)
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
     handler = _STATUS_HANDLERS.get(s)
@@ -615,6 +625,8 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
+    with _map_errors(400, _StatusRejected):
+        _guard_direction_status(conn, task_id, s)
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
@@ -725,6 +737,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             (task_id,)).fetchone()
         if prev is None:
             return False
+        if prev["status"] == "needs_direction" or new_status == "needs_direction":
+            raise _StatusRejected(_DIRECTION_STATUS_MSG)
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -804,6 +818,8 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    if payload.archive:
+        _guard_direction_status(conn, tid, "archived")
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:

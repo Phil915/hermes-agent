@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -23,6 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_NEEDS_DIRECTION_SCHEMA, KANBAN_ANSWER_DIRECTION_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -102,6 +104,13 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _visible(to_env_worker=False)
 
 
+@no_cache_check_fn
+def _check_kanban_worker_mode() -> bool:
+    """Direction waits belong only to the dispatcher-owned Worker conversation."""
+    return (bool(os.environ.get("HERMES_KANBAN_TASK"))
+            and not _is_delegated_child_context() and _is_dispatcher_owned_worker())
+
+
 # --- Shared helpers: validation failures raise _Reject; _kanban_handler renders it ---
 
 # Worker tools that terminate or transition a run's ownership. An unbound worker
@@ -111,6 +120,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 _RUN_LIFECYCLE_TOOLS = frozenset({
     "kanban_complete", "kanban_block",
     "kanban_request_review", "kanban_request_changes",
+    "kanban_needs_direction",
 })
 
 class _Reject(Exception):
@@ -621,9 +631,11 @@ def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli.kanban_direction import latest_direction
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
+            "developer_question": latest_direction(conn, tid),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -636,6 +648,77 @@ def _handle_show(args: dict, **kw) -> str:
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
             "worker_context": kb.build_worker_context(conn, tid)})
+
+
+@_kanban_handler("kanban_needs_direction")
+def _handle_needs_direction(args: dict, **kw) -> str:
+    """Keep this Worker tool call paused until its owner supplies a durable decision."""
+    from hermes_cli.kanban_direction import consume_direction, request_direction
+    from tools.interrupt import is_interrupted
+
+    tid = _worker_guard("kanban_needs_direction", args)
+    _check(_check_kanban_worker_mode(), "kanban_needs_direction requires the owning dispatcher Worker")
+    metadata = _stamp_worker_session_metadata(tid, {}) or {}
+    session_id = metadata.get("worker_session_id")
+    claim_lock = _own_task_env(tid, "HERMES_KANBAN_CLAIM_LOCK")
+    _check(session_id and session_id.strip(), "Worker session identity is required to pause safely")
+    _check(claim_lock, "Worker claim identity is required to pause safely")
+    run_id = _worker_run_id(tid)
+    question = args.get("developer_question")
+    _check(isinstance(question, dict), "developer_question must be an object")
+    question = _redact_metadata(question)
+    _check(question is not None, "developer_question could not be safely serialized")
+    with _board(args.get("board")) as (_, conn):
+        record = request_direction(
+            conn, tid, expected_run_id=run_id, worker_session_id=session_id, question=question)
+        database_wait_logged = False
+        while not is_interrupted():
+            try:
+                resumed = consume_direction(
+                    conn, tid, record["id"], expected_run_id=run_id, claim_lock=claim_lock)
+            except sqlite3.Error as exc:
+                # A durable pause cannot turn into a model turn just because
+                # another board writer briefly holds the DB. Keep this call parked.
+                if not database_wait_logged:
+                    logger.warning("Kanban direction wait for %s remains paused: %s", tid, exc)
+                    database_wait_logged = True
+                time.sleep(1.0)
+                continue
+            if resumed is not None:
+                return _ok(task_id=tid, run_id=run_id, question_id=record["id"],
+                           status="running", response=resumed["response"])
+            # The DB helpers commit before returning: the Developer can answer on
+            # another connection while the original Worker/tool context stays alive.
+            time.sleep(1.0)
+        return _ok(task_id=tid, run_id=run_id, question_id=record["id"],
+                   status="needs_direction", paused=True,
+                   instruction="Remain paused; do not guess, retry, or hard-block this decision.")
+
+
+@_kanban_handler("kanban_answer_direction")
+def _handle_answer_direction(args: dict, **kw) -> str:
+    """Persist the owning Developer's response; the same waiting Worker consumes it."""
+    from hermes_cli.kanban_direction import answer_direction
+
+    _reject_delegated_child_mutation("kanban_answer_direction")
+    _require_orchestrator_tool("kanban_answer_direction")
+    tid = _require_task_id(args)
+    question_id = _require_text(args, "question_id")
+    response = args.get("response")
+    _check(isinstance(response, dict), "response must be an object")
+    response = _redact_metadata(response)
+    _check(response is not None, "response could not be safely serialized")
+    responder_session = _resolve_notify_target()
+    _check(responder_session, "Answer from the owning Developer/coordinator conversation")
+    from gateway.session_context import get_session_env
+    responder_session["session_id"] = get_session_env("HERMES_SESSION_ID", "")
+    with _board(args.get("board")) as (_, conn):
+        record = answer_direction(conn, tid, question_id,
+                                  responder_profile=_persisted_identity(), response=response,
+                                  responder_session=responder_session)
+        return _ok(task_id=tid, question_id=record["id"],
+                   answered=True, resumed=record["resumed_at"] is not None,
+                   response=record["response"])
 
 
 @_kanban_handler("kanban_list")
@@ -1181,12 +1264,14 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_answer_direction"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
+    ("kanban_needs_direction", KANBAN_NEEDS_DIRECTION_SCHEMA, _handle_needs_direction, "⏸"),
+    ("kanban_answer_direction", KANBAN_ANSWER_DIRECTION_SCHEMA, _handle_answer_direction, "▶"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
@@ -1200,5 +1285,7 @@ _TOOLS = (
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    if _name == "kanban_needs_direction":
+        _gate = _check_kanban_worker_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)

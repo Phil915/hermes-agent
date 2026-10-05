@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass
+import json
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -21,6 +22,44 @@ logger = logging.getLogger("agent.conversation_loop")
 
 # Post-response housekeeping tools: a round made only of these mutes tool progress.
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
+
+
+def _is_direction_call(tool_call: Any) -> bool:
+    """Resolve the deferred-tool wrapper before applying the standalone-call rule."""
+    from agent.tool_dispatch_helpers import _peel_bridge_call
+
+    name = tool_call.function.name
+    if name == "kanban_needs_direction":
+        return True
+    if name != "tool_call":
+        return False
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except (TypeError, ValueError):
+        return False  # Mixed invalid-name calls are already assigned error results.
+    return isinstance(args, dict) and _peel_bridge_call(name, args)[0] == "kanban_needs_direction"
+
+
+def _direction_answer_returned(messages: Any, tool_call: Any) -> bool:
+    """Only a persisted successful answer refunds the upstream-decision iteration."""
+    call_id = coalesce_tool_call_id(tool_call)
+    for message in reversed(messages):
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return False
+        try:
+            # Budget checkpoints may append a note after the tool's JSON object.
+            result, _ = json.JSONDecoder().raw_decode(content.lstrip())
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(result, dict) and result.get("ok") is True
+            and result.get("status") == "running" and bool(result.get("question_id"))
+            and isinstance(result.get("response"), dict)
+        )
+    return False
 
 
 @dataclass
@@ -84,10 +123,14 @@ def run_tool_round(
     if _tvv.action == "continue":
         return _verdict("continue")
 
-    # Post-call guardrails.
-    assistant_message.tool_calls = agent._deduplicate_tool_calls(
-        agent._cap_delegate_task_calls(assistant_message.tool_calls)
-    )
+    direction_call = any(_is_direction_call(tc) for tc in assistant_message.tool_calls)
+    refuse_direction_batch = direction_call and len(assistant_message.tool_calls) != 1
+    # A decision must reach the model before any dependent calls are generated.
+    # Refuse the entire mixed round, including calls before the question.
+    if not refuse_direction_batch:
+        assistant_message.tool_calls = agent._deduplicate_tool_calls(
+            agent._cap_delegate_task_calls(assistant_message.tool_calls)
+        )
 
     # Mixed batch: the assistant message keeps EVERY emitted call (each tool_call needs a
     # matching result) while only valid ones dispatch.
@@ -101,7 +144,7 @@ def run_tool_round(
     append_message(messages, assistant_msg)
 
     # Mixed batch: error-result invalid calls and drop them from execution.
-    if _invalid_batch_calls:
+    if _invalid_batch_calls and not refuse_direction_batch:
         for tc in _invalid_batch_calls:
             append_message(messages, {
                 "role": "tool",
@@ -145,6 +188,24 @@ def run_tool_round(
     if not duplicate_previous_interim:
         agent._emit_interim_assistant_message(assistant_msg)
 
+    if refuse_direction_batch:
+        from agent.tool_executor import _flush_session_db_after_tool_progress
+
+        for tc in assistant_message.tool_calls:
+            append_message(messages, {
+                "role": "tool", "name": tc.function.name,
+                "tool_call_id": coalesce_tool_call_id(tc),
+                "content": json.dumps({"error": (
+                    "No calls in this batch ran. kanban_needs_direction must be called alone; "
+                    "read the Developer response before choosing subsequent actions."
+                )}),
+            })
+        agent._session_messages = messages
+        if not _flush_session_db_after_tool_progress(agent, messages, stage="rejected direction batch"):
+            _turn_exit_reason, final_response, failed = "session_persistence_failed", "", True
+            return _verdict("break")
+        return _verdict("continue")
+
     # Flush open streaming boxes before tools so early content doesn't wrap tool feed
     # lines. Display callback only — TTS (_stream_callback) must NOT receive None (EOS).
     if agent.stream_delta_callback:
@@ -160,6 +221,12 @@ def run_tool_round(
         final_response = ""
         failed = True
         return _verdict("break")
+
+    if direction_call and _direction_answer_returned(messages, assistant_message.tool_calls[0]):
+        agent.iteration_budget.refund()
+        # Preserve the real API count (also used for request identity) while
+        # crediting this decision-only round against the implementation cap.
+        agent.max_iterations += 1
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision

@@ -434,6 +434,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
     ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
     from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive, _single_query_exit_code
+    from hermes_cli.kanban_direction_admission import admit_direction_resume_from_env
+    if not admit_direction_resume_from_env(worker_session_id=getattr(cli, "session_id", "") or ""):
+        from hermes_cli.quiet_single_query import exit_single_query
+        exit_single_query(0)
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(

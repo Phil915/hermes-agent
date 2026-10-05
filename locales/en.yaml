@@ -196,6 +196,7 @@ gateway:
       timed_out:           "timed out; dispatcher will retry"
       blocked:             "blocked; needs attention"
       review_requested:    "handed off for review; the implementation is done"
+      developer_question:  "NEEDS_DIRECTION; the Worker is paused for an upstream decision"
       changes_requested:   "review requested changes (BLOCK); implementation is not approved"
       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
       status_default:      "status changed"

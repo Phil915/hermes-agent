@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from functools import partial
 from pathlib import Path
@@ -33,10 +34,23 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "developer_question")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "developer_question")
+
+
+def _event_for_subscription(ev: Any, sub: dict) -> bool:
+    """Decision requests belong only to the persisted coordinator's wake route."""
+    if ev.kind != "developer_question":
+        return True
+    payload = ev.payload or {}
+    owner = payload.get("owner_profile")
+    session = payload.get("owner_session") or {}
+    from hermes_cli.kanban_direction import session_identity
+    return bool(owner and owner == sub.get("notifier_profile")
+                and sub.get("delivery_mode") in ("notify+wake", "wake")
+                and session_identity(session) == session_identity(sub))
 
 
 def diagnostic_event(ev) -> bool:
@@ -301,6 +315,10 @@ class _Collector:
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
         )
+        # Other subscribers may still receive ordinary status events, but a
+        # Worker question must not grant decision authority to those sessions.
+        # The claimed cursor already settles their intentionally silent events.
+        events = [ev for ev in events if _event_for_subscription(ev, sub)]
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
@@ -400,6 +418,27 @@ def _fmt_review_requested(ev, n) -> tuple:
     return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
 
 
+def _fmt_developer_question(ev, n) -> tuple:
+    question = (ev.payload or {}).get("question") or {}
+    text = _safe_review_reason(question.get("question"), 240)
+    return f"⏸ {n.head} NEEDS_DIRECTION — {text}", None, None
+
+
+def _direction_wake_text(ev, task_id: str) -> str:
+    payload = ev.payload or {}
+    question_id = payload.get("question_id")
+    question = json.dumps(payload.get("question") or {}, ensure_ascii=False, indent=2)[:8192]
+    return (
+        f"Worker question {question_id}:\n{question}\n\n"
+        "The existing Worker/card is soft-paused and retains its assignment, branch, worktree, "
+        "and activity. Answer the upstream decision with "
+        f"kanban_answer_direction(task_id={task_id!r}, question_id={question_id!r}, "
+        "response={decision, rationale, scope_note (optional), resume_instruction}). "
+        "Use the existing card; do not create correction or replacement work. "
+        "Without an answer the Worker remains paused."
+    )
+
+
 def _fmt_changes_requested(ev, n) -> tuple:
     payload = ev.payload or {}
     reason = _safe_review_reason(payload.get("reason"))
@@ -466,6 +505,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
+    "developer_question": _fmt_developer_question,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
 }
@@ -585,6 +625,9 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+        for ev in self.d["events"]:
+            if ev.kind == "developer_question":
+                synth += "\n\n" + _direction_wake_text(ev, self.task_id)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:

@@ -830,7 +830,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       COALESCE(r.started_at, t.started_at) + COALESCE(r.direction_paused_seconds, 0) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -940,7 +940,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       COALESCE(r.started_at, t.started_at) + COALESCE(r.direction_paused_seconds, 0) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -1547,7 +1547,7 @@ def _record_task_failure(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if row is None:
+        if row is None or row["status"] == "needs_direction":
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -2057,18 +2057,19 @@ def observed_execution_state(conn: sqlite3.Connection, task: "Task") -> str:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
+    """Execution slots: running tasks plus live Workers waiting for direction.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
     """
     try:
+        from hermes_cli.kanban_direction import paused_worker_counts
         return int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
             ).fetchone()[0]
-        )
+        ) + sum(paused_worker_counts(conn).values())
     except Exception:
         return 0
 
@@ -2617,6 +2618,16 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    from hermes_cli.kanban_direction import paused_worker_counts, resume_answered_workers
+    for profile, count in paused_worker_counts(conn).items():
+        per_profile_running[profile] = per_profile_running.get(profile, 0) + count
+    resumed_count = resume_answered_workers(
+        conn, result, spawn_fn=spawn_fn, board=board, dry_run=dry_run,
+        spawn_budget=spawn_budget, per_profile_cap=per_profile_cap,
+        per_profile_running=per_profile_running,
+    )
+    if spawn_budget is not None:
+        spawn_budget -= resumed_count
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2989,7 +3000,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    if task.direction_resume_session_id:
+        cmd.extend(["--resume", task.direction_resume_session_id, "--no-restore-cwd"])
+    cmd.extend(["chat", "-q", task.direction_resume_prompt or f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
@@ -3072,6 +3085,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # HERMES_PROFILE (set below) instead.
         profile_home = None
 
+    from hermes_cli.kanban_direction import validate_resume_session
+    validate_resume_session(task, profile_home)
+
     # Scrub for a ROUTED home, not only under multiplex: the authority test is "does this worker act
     # for another profile", exactly as served_profile_child_env decides it (tools/environments/local.py).
     # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
@@ -3125,6 +3141,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.direction_resume_token:
+        env["HERMES_KANBAN_DIRECTION_TOKEN"] = task.direction_resume_token
+    else:
+        env.pop("HERMES_KANBAN_DIRECTION_TOKEN", None)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).

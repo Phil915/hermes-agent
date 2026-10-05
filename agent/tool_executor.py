@@ -848,7 +848,10 @@ def _resolve_sequential_tool_timeout() -> float | None:
 # one run).
 # ``manage_connections`` waits on the connection operation's own deadline; the generic deadline
 # would return tool_timeout while its approval card is still open.
-_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections"})
+# ``kanban_needs_direction`` durably pauses the owned card until its coordinator answers.
+_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({
+    "delegate_task", "manage_connections", "kanban_needs_direction",
+})
 
 
 def _abandoned_sequential_result(agent, ref: _ToolCallRef, message: str, result_cls, **outcome) -> _ManagedToolResult:
@@ -1760,6 +1763,10 @@ def _run_sequential_call(
         if dispatch.is_delegate:
             agent._delegate_spinner = None
         tool_duration = time.time() - tool_start_time
+        if ref.name == "kanban_needs_direction" and getattr(agent, "_run_budget_started_at", None) is not None:
+            # Exclude the wait before publishing the result: publishing also injects
+            # budget warnings, which must not mistake upstream deliberation for work.
+            agent._run_budget_started_at += tool_duration
         if dispatch.finish_spinner and dispatch.finish_in_finally:
             _finish_quiet_tool_spinner(agent, dispatch.spinner, ref.name, ref.args, tool_duration, _spinner_result)
     if dispatch.finish_spinner and not dispatch.finish_in_finally:

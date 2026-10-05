@@ -858,6 +858,7 @@ _TASK_RUN_COLUMNS = (
     ("terminal_result", "terminal_result TEXT"),
     ("exit_reason", "exit_reason TEXT"),
     ("last_activity_at", "last_activity_at INTEGER"),
+    ("direction_paused_seconds", "direction_paused_seconds INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -1039,7 +1040,7 @@ _REBUILD_SPECS = {
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT, terminal_result TEXT, exit_reason TEXT,"
-        " last_activity_at INTEGER)",
+        " last_activity_at INTEGER, direction_paused_seconds INTEGER NOT NULL DEFAULT 0)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

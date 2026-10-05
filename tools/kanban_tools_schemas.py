@@ -74,7 +74,7 @@ KANBAN_LIST_SCHEMA = _schema(
             "type": "string",
             "enum": [
                 "triage", "todo", "ready", "running",
-                "blocked", "done", "archived",
+                "needs_direction", "blocked", "done", "archived",
             ],
             "description": "Optional task status filter.",
         },
@@ -176,7 +176,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "block on things you can resolve yourself. Use kanban_needs_direction for "
+        "an upstream Developer decision while preserving your current run."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -197,6 +198,90 @@ KANBAN_BLOCK_SCHEMA = _schema(
         },
     },
     ["reason"],
+)
+
+KANBAN_NEEDS_DIRECTION_SCHEMA = _schema(
+    "kanban_needs_direction",
+    (
+        "Pause your current Worker/card for a genuine upstream Developer decision. "
+        "Durably saves a bounded developer_question and wakes the owning coordinator. "
+        "This call waits indefinitely for that coordinator's answer, then returns the "
+        "response into this same Worker conversation; card, run, assignment and workspace "
+        "are preserved. No failure or correction budget is consumed. Only use for unresolved "
+        "canon interpretation, architecture, scope, migration/public interfaces, conflicting "
+        "requirements, authority boundaries, or a choice with meaningful rework risk. Check "
+        "canon and code precedent first. Never use for ordinary implementation details, "
+        "naming, routine test failures, local refactors, style, or an already-resolved question. "
+        "Finish work that can safely continue before calling. The question must total at "
+        "most 8000 characters."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "developer_question": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "question": _prop("string", "The bounded upstream decision to resolve."),
+                "why_it_matters": _prop("string", "Consequence of guessing incorrectly."),
+                "evidence": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "references": {
+                            "type": "array", "minItems": 1, "maxItems": 5,
+                            "items": {"type": "string"},
+                            "description": "Relevant canon or code references already checked.",
+                        },
+                        "precedent_status": {
+                            "type": "string", "enum": ["unresolved", "conflicting"],
+                            "description": "Existing canon/code leaves this unresolved or conflicting.",
+                        },
+                    },
+                    "required": ["references", "precedent_status"],
+                },
+                "options": {
+                    "type": "array", "minItems": 1, "maxItems": 3,
+                    "items": {"type": "string"},
+                    "description": "One to three bounded alternatives with their tradeoffs.",
+                },
+                "worker_recommendation": _prop("string", "Optional preferred option and short reason."),
+                "work_that_can_continue": _prop("string", "Optional independent work or its completed result."),
+                "decision_needed": {
+                    "type": "string",
+                    "enum": ["canon_interpretation", "architecture", "scope_expansion",
+                             "migration_or_public_interface", "conflicting_requirements",
+                             "authority_boundary", "meaningful_rework"],
+                    "description": "The upstream decision category; routine implementation is not eligible.",
+                },
+            },
+            "required": ["question", "why_it_matters", "evidence", "options", "decision_needed"],
+        },
+    },
+    ["developer_question"],
+)
+
+KANBAN_ANSWER_DIRECTION_SCHEMA = _schema(
+    "kanban_answer_direction",
+    (
+        "Answer a pending developer_question as its owning Developer/coordinator. "
+        "Persists your bounded decision for the same paused Worker/card to resume. "
+        "Requires the owning profile and conversation. Replaying the same response is "
+        "idempotent; a conflicting replay is rejected. Dispatcher Workers cannot answer. "
+        "The response must total at most 4000 characters."
+    ),
+    {
+        "task_id": _prop("string", "Card whose Worker requested direction."),
+        "question_id": _prop("string", "Exact question id from the notification or kanban_show."),
+        "response": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "decision": _prop("string", "The concrete decision."),
+                "rationale": _prop("string", "Short reason for the decision."),
+                "scope_note": _prop("string", "Optional scope boundary."),
+                "resume_instruction": _prop("string", "What this same Worker should do next."),
+            },
+            "required": ["decision", "rationale", "resume_instruction"],
+        },
+    },
+    ["task_id", "question_id", "response"],
 )
 
 KANBAN_REQUEST_REVIEW_SCHEMA = _schema(

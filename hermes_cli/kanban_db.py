@@ -100,7 +100,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "needs_direction", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -738,6 +738,10 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Dispatch-only continuation projection; never a new run or persisted task identity.
+    direction_resume_session_id: Optional[str] = None
+    direction_resume_prompt: Optional[str] = None
+    direction_resume_token: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1038,7 +1042,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Durable execution terminal envelope. execution_id is this row's id.
     terminal_result     TEXT,
     exit_reason         TEXT,
-    last_activity_at    INTEGER
+    last_activity_at    INTEGER,
+    direction_paused_seconds INTEGER NOT NULL DEFAULT 0
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1089,6 +1094,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+
+from hermes_cli.kanban_direction import SCHEMA_SQL as _DIRECTION_SCHEMA_SQL
+SCHEMA_SQL += _DIRECTION_SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -1569,7 +1577,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if row["claim_lock"] is not None and row["status"] in {"running", "needs_direction"}:
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
@@ -2616,6 +2624,8 @@ def reclaim_task(
     ).fetchone()
     if not row:
         return False
+    if row["status"] == "needs_direction":
+        return False  # A decision wait is not a stale claim to terminate/retry.
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
@@ -3974,7 +3984,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs", "developer_questions"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4048,6 +4058,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
+    from hermes_cli.kanban_direction import direction_context
+    lines.append(direction_context(conn, task_id))
     return "\n".join(lines).rstrip() + "\n"
 
 

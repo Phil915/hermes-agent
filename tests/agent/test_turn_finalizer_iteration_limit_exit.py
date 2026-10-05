@@ -171,6 +171,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
@@ -242,6 +243,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
@@ -283,6 +285,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
@@ -316,6 +319,7 @@ def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
@@ -347,6 +351,7 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent(budget_remaining=60)
 
@@ -382,6 +387,7 @@ def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatc
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *_: SimpleNamespace(status="running"))
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 

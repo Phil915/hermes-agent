@@ -61,6 +61,9 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
+            task = _kb.get_task(_conn, kanban_task)
+            if task is not None and task.status == "needs_direction":
+                return  # A paused decision is not an exhausted implementation attempt.
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,
