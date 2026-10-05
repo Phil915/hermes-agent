@@ -427,7 +427,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
-    if _json_out(args, [_task_to_dict(t) for t in tasks]):
+        observed = {t.id: kbd.observed_execution_state(conn, t) for t in tasks}
+    if _json_out(args, [_task_to_dict(t, observed[t.id]) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
     try:
@@ -442,7 +443,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, observed[t.id]))
     return 0
 
 

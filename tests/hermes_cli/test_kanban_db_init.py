@@ -6,6 +6,7 @@ from pathlib import Path
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 def _make_legacy_db(path: Path) -> None:
@@ -107,6 +108,54 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert isinstance(new_id, int) and new_id >= 1
 
 
+def test_legacy_task_runs_rebuild_supports_closeout_and_crash_reconciliation(
+    tmp_path, monkeypatch,
+):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect(db_path) as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")}
+        assert {"terminal_result", "exit_reason", "last_activity_at"} <= columns
+
+        complete_id = kb.create_task(conn, title="post-migration closeout", assignee="worker")
+        claimed = kb.claim_task(conn, complete_id)
+        assert claimed is not None
+        assert kb.complete_task(
+            conn, complete_id, result="done", expected_run_id=claimed.current_run_id,
+        )
+        completed_run = conn.execute(
+            "SELECT terminal_result, exit_reason, last_activity_at FROM task_runs "
+            "WHERE id = ?", (claimed.current_run_id,),
+        ).fetchone()
+        assert completed_run["terminal_result"] == "PASS"
+        assert completed_run["exit_reason"]
+        assert completed_run["last_activity_at"]
+
+        crash_id = kb.create_task(conn, title="post-migration crash", assignee="worker")
+        worker_run = kb.claim_task(conn, crash_id)
+        assert worker_run is not None
+        assert kb.request_review(
+            conn, crash_id, summary="ready", reviewer="reviewer",
+            expected_run_id=worker_run.current_run_id,
+        )
+        review_run = kb.claim_review_task(conn, crash_id)
+        assert review_run is not None and review_run.current_run_id is not None
+        kbd._set_worker_pid(conn, crash_id, 999_999_999)
+
+        assert crash_id in kbd.detect_crashed_workers(conn)
+        reconciled = kb.get_task(conn, crash_id)
+        assert reconciled is not None
+        assert reconciled.status in {"review", "blocked"}
+        assert reconciled.current_run_id is None
+        crashed_run = conn.execute(
+            "SELECT terminal_result, exit_reason, last_activity_at FROM task_runs "
+            "WHERE id = ?", (review_run.current_run_id,),
+        ).fetchone()
+        assert crashed_run["terminal_result"] == "CRASHED"
+        assert crashed_run["exit_reason"]
+        assert crashed_run["last_activity_at"]
 
 
 def test_migration_is_idempotent(tmp_path, monkeypatch):

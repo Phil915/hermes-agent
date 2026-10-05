@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -32,6 +34,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from hermes_cli.auth_constants import AuthError
 
 
 @pytest.fixture
@@ -929,3 +932,437 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Role-isolated routing and abnormal reviewer termination
+# ---------------------------------------------------------------------------
+
+
+def test_review_dispatch_uses_reviewer_route_not_worker_overrides(kanban_home: Path) -> None:
+    """WP-4.1 regression: an AI1-only worker model must not cross the handoff."""
+    captured = []
+    reviewer_route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+
+    def route_resolver(task, lane):
+        assert lane == "review"
+        # The resolver sees the durable card, including its worker-only route,
+        # but resolves from the reviewer profile because the lane is review.
+        assert task.model_override == "qwen38-27b-mtp-fullctx"
+        assert task.provider_override == "custom"
+        return reviewer_route
+
+    def spawn(task, workspace):
+        captured.append(task)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="AI1 implementation followed by Developer review",
+            assignee="sii-worker",
+            model_override="qwen38-27b-mtp-fullctx",
+            provider_override="custom",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="implementation ready",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=spawn,
+                route_resolver=route_resolver,
+                reconcile_orphans=False,
+            )
+
+        assert result.spawned and captured
+        dispatched = captured[0]
+        assert dispatched.assignee == "reviewer"
+        assert dispatched.model_override == "gpt-5.6-codex"
+        assert dispatched.provider_override == "openai-codex"
+        assert dispatched.model_override != "qwen38-27b-mtp-fullctx"
+
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (kb.get_task(conn, tid).current_run_id,),
+        ).fetchone()
+        route = json.loads(run["metadata"])["dispatch_route"]
+        assert route == reviewer_route.as_dict()
+
+        # Route projection is per execution; the product card keeps the Worker route.
+        persisted = kb.get_task(conn, tid)
+        assert persisted.model_override == "qwen38-27b-mtp-fullctx"
+        assert persisted.provider_override == "custom"
+
+
+def test_custom_spawn_clears_worker_overrides_on_review(kanban_home: Path) -> None:
+    """Embedders using a custom spawn function must not receive the Worker route."""
+    captured = []
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="custom review spawn",
+            assignee="sii-worker",
+            model_override="qwen38-27b-mtp-fullctx",
+            provider_override="custom",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: captured.append(task),
+                reconcile_orphans=False,
+            )
+        assert result.spawned and captured
+        assert captured[0].assignee == "reviewer"
+        assert captured[0].model_override is None
+        assert captured[0].provider_override is None
+
+
+def test_invalid_reviewer_route_blocks_immediately_with_terminal_fail(kanban_home: Path) -> None:
+    """Invalid model/provider pairs are deterministic, not respawn candidates."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="invalid reviewer route", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: pytest.fail("invalid route must not spawn"),
+                route_resolver=lambda task, lane: (_ for _ in ()).throw(
+                    kbd.DeterministicRoutingError(
+                        "qwen38-27b-mtp-fullctx is not a valid model ID for openai-codex"
+                    )
+                ),
+                reconcile_orphans=False,
+            )
+
+        assert tid in result.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        run = conn.execute(
+            "SELECT id, outcome, error, terminal_result, exit_reason, last_activity_at "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert run["outcome"] == "gave_up"
+        assert "deterministic routing failure" in run["error"]
+        assert run["terminal_result"] == "FAIL"
+        assert run["id"]
+        assert run["exit_reason"]
+        assert run["last_activity_at"]
+
+
+def test_production_route_resolver_classifies_terminal_auth_config_as_deterministic(
+    kanban_home: Path,
+) -> None:
+    """Unknown/missing provider configuration must fail before bounded retry."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="invalid production route", assignee="reviewer")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        with (
+            patch("gateway.run._profile_runtime_scope", return_value=nullcontext()),
+            patch("hermes_cli.profiles.get_profile_dir", return_value=kanban_home),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"model": {"default": "gpt-5.6-codex", "provider": "invalid_provider"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=AuthError("Unknown provider 'invalid_provider'.", code="invalid_provider"),
+            ),
+        ):
+            with pytest.raises(kbd.DeterministicRoutingError, match="invalid_provider"):
+                kbd._resolve_dispatch_route(task, "review")
+
+
+def test_route_auth_classifier_covers_known_configuration_failures() -> None:
+    deterministic = [
+        AuthError("No Anthropic credentials found."),
+        AuthError("No Azure Anthropic API key found."),
+        AuthError("Vertex AI credentials could not be resolved."),
+        AuthError("Azure Foundry requires an API key."),
+        AuthError("Azure Foundry requires a base URL."),
+        AuthError("No AWS credentials found for Bedrock.", code="no_aws_credentials"),
+        AuthError("Could not find the CLI command.", code="missing_external_process_cli"),
+    ]
+    assert all(kbd._route_auth_error_is_deterministic(exc) for exc in deterministic)
+    assert not kbd._route_auth_error_is_deterministic(
+        AuthError("Anthropic credentials are rate-limited for model.")
+    )
+    assert not kbd._route_auth_error_is_deterministic(
+        AuthError(
+            "No AWS credentials found for Bedrock.",
+            code="no_aws_credentials",
+            retryable=True,
+        )
+    )
+
+
+def test_production_codex_quota_without_retryable_hint_requeues(
+    kanban_home: Path,
+) -> None:
+    """A Codex quota result remains retryable even when legacy code omitted the hint."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="temporary Codex quota", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with (
+            patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True),
+            patch("gateway.run._profile_runtime_scope", return_value=nullcontext()),
+            patch("hermes_cli.profiles.get_profile_dir", return_value=kanban_home),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"model": {"default": "gpt-5.6-codex", "provider": "openai-codex"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=AuthError(
+                    "Codex provider quota exhausted (429). Credentials are still valid.",
+                    provider="openai-codex",
+                    code="codex_rate_limited",
+                ),
+            ),
+        ):
+            result = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: None,
+                route_resolver=kbd._resolve_dispatch_route,
+            )
+
+        assert result.auto_blocked == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "review"
+        run = conn.execute(
+            "SELECT outcome, terminal_result FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "route_resolution_failed"
+        assert run["terminal_result"] == "CRASHED"
+
+
+def test_transient_reviewer_route_failure_requeues_and_recovers(kanban_home: Path) -> None:
+    """A temporary resolver outage must not sticky-block the review conveyor."""
+    route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+    attempts = 0
+    spawned = []
+
+    def resolver(task, lane):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise AuthError(
+                "temporary authentication service unavailable",
+                provider="openai-codex",
+                code="token_refresh_timeout",
+                retryable=True,
+            )
+        return route
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="transient review route", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            first = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: spawned.append(task),
+                route_resolver=resolver,
+                reconcile_orphans=False,
+            )
+        assert first.auto_blocked == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "review"
+        assert task.current_run_id is None
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            second = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: spawned.append(task),
+                route_resolver=resolver,
+                reconcile_orphans=False,
+            )
+        assert second.spawned and spawned
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        runs = conn.execute(
+            "SELECT outcome, terminal_result FROM task_runs WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert any(
+            r["outcome"] == "route_resolution_failed" and r["terminal_result"] == "CRASHED"
+            for r in runs
+        )
+
+
+def test_observed_state_honors_worker_launch_grace(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="launch grace", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kbd._set_worker_pid(conn, tid, 999_999_999)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kbd.observed_execution_state(conn, task) == "starting"
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 31 WHERE id = ?",
+            (claimed.current_run_id,),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kbd.observed_execution_state(conn, task) == "crashed"
+
+
+def test_crash_reconciliation_honors_current_run_launch_grace(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    dead_pid = 999_999_999
+    reviewer_route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="relaunched review grace", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        conn.execute("UPDATE tasks SET started_at = started_at - 3600 WHERE id = ?", (tid,))
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            dispatched = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: dead_pid,
+                route_resolver=lambda task, lane: reviewer_route,
+                reconcile_orphans=False,
+            )
+        assert dispatched.spawned
+        review_task = kb.get_task(conn, tid)
+        assert review_task is not None
+        review_run_id = review_task.current_run_id
+        assert review_run_id is not None
+
+        assert kbd.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == review_run_id
+        run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (review_run_id,)).fetchone()
+        assert run["ended_at"] is None
+
+
+def test_reviewer_crash_is_terminal_and_reconciled_without_prompting(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished reviewer cannot leave a card pretending to be in flight."""
+    reviewer_route = kbd.DispatchRoute(
+        role="developer_reviewer",
+        profile="reviewer",
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-codex",
+        api_mode="codex_app_server",
+    )
+    dead_pid = 999_999_999
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reviewer crashes", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            first = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: dead_pid,
+                route_resolver=lambda task, lane: reviewer_route,
+                reconcile_orphans=False,
+            )
+        assert first.spawned
+        review_run_id = kb.get_task(conn, tid).current_run_id
+        assert review_run_id is not None
+        # Reporting inspects the live run/PID instead of repeating the intended
+        # persisted state (which is still "running" until reconciliation).
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        in_flight = kb.get_task(conn, tid)
+        assert in_flight is not None
+        assert in_flight.status == "running"
+        assert kbd.observed_execution_state(conn, in_flight) == "crashed"
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=lambda _: True):
+            second = kbd.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: None,
+                route_resolver=lambda task, lane: reviewer_route,
+                max_spawn=0,
+            )
+
+        assert tid in second.crashed
+        task = kb.get_task(conn, tid)
+        assert task.status in {"review", "blocked"}
+        assert task.status != "running"
+        assert task.current_run_id is None
+
+        run = conn.execute(
+            "SELECT ended_at, terminal_result, exit_reason, last_activity_at, metadata "
+            "FROM task_runs WHERE id = ?", (review_run_id,),
+        ).fetchone()
+        assert run["ended_at"] is not None
+        assert run["terminal_result"] == "CRASHED"
+        assert review_run_id
+        assert run["exit_reason"]
+        assert run["last_activity_at"]
+        metadata = json.loads(run["metadata"])
+        assert metadata["dispatch_route"] == reviewer_route.as_dict()
+        assert metadata["execution_id"] == review_run_id

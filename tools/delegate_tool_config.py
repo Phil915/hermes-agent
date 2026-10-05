@@ -426,6 +426,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     if values["base_url"] and not is_native_sdk_provider:
         return _direct_endpoint_credentials(values, explicit_request_overrides)
+    if values["model"] and not values["provider"]:
+        raise ValueError(
+            "delegation.model requires a complete delegation route: configure "
+            "delegation.provider or delegation.base_url explicitly"
+        )
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
         return _credential_bundle(

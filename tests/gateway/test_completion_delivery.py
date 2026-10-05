@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -741,6 +742,108 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
 
     asyncio.run(_exercise())
     adapter.handle_message.assert_awaited_once()
+
+
+def test_aged_secondary_completion_enters_delivery_consumer_exactly_once(
+    tmp_path, monkeypatch, isolated_registry,
+):
+    """A restored default-transport/SII-runtime completion uses the transport adapter and SII ledger."""
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionEntry
+    from gateway.session_identity import identity_of
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation
+
+    secondary_home = tmp_path / "secondary"
+    now = time.time()
+    session_key = "agent:secondary:telegram:dm:12345:678"
+    event = _async_event("deleg_aged_secondary")
+    event.update({
+        "session_key": session_key,
+        "origin_profile": "secondary",
+        "origin_hermes_home": str(secondary_home),
+        "parent_session_id": "parent-session",
+        "dispatched_at": now - 2,
+        "completed_at": now - 1,
+    })
+    token = set_hermes_home_override(secondary_home)
+    try:
+        _persist_pending_completion(event)
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        eligible_at = time.time() + async_delegation._PENDING_DELIVERY_GRACE_S + 1
+        assert async_delegation.sweep_orphaned_completions(
+            isolated_registry.completion_queue, now=eligible_at,
+        ) == 1
+    finally:
+        reset_hermes_home_override(token)
+
+    entry = SessionEntry.from_dict({
+        "session_key": session_key,
+        "session_id": "parent-session",
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "transport_profile": "default",
+        "origin": {
+            "platform": "telegram",
+            "chat_id": "12345",
+            "chat_type": "dm",
+            "user_id": "678",
+            "profile": "secondary",
+        },
+    })
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter, origins={session_key: entry})
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner._profile_adapters = {"secondary": {}}
+    runner._resolve_profile_home_for_source = lambda source: secondary_home
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
+    source = runner._build_process_event_source(event)
+    restored_identity = identity_of(source)
+    assert source.profile == "secondary"
+    assert restored_identity is not None
+    assert (restored_identity.transport_profile, restored_identity.runtime_profile) == (
+        "default", "secondary",
+    )
+    assert runner._resolve_injection_adapter("telegram", source) is adapter
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    token = set_hermes_home_override(secondary_home)
+    try:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        assert row["delivery_recovery_reason"] == "aged_pending_live_owner"
+        assert row["delivery_state"] == "delivered"
+        assert row["delivery_attempts"] == 1
+        assert row["delivered_at"] is not None
+        assert async_delegation.restore_undelivered_completions(
+            isolated_registry.completion_queue,
+        ) == 0
+        assert async_delegation.sweep_orphaned_completions(
+            isolated_registry.completion_queue,
+            now=eligible_at + async_delegation.ORPHAN_SWEEP_INTERVAL_S,
+        ) == 0
+    finally:
+        reset_hermes_home_override(token)
+
+    # Even if both in-process suppression caches disappear, queued duplicate offers cannot redeliver
+    # an already acknowledged durable row.
+    runner._completion_deliveries_delivered.clear()
+    with async_delegation._orphan_lock:
+        async_delegation._offered.clear()
+    isolated_registry.completion_queue.put(dict(event))
+    isolated_registry.completion_queue.put(dict(event))
+    runner._running = True
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    assert isolated_registry.completion_queue.empty()
 
 
 # ---------------------------------------------------------------------------

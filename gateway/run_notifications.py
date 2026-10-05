@@ -1268,9 +1268,19 @@ class GatewayNotificationsMixin:
                 return owner[0]
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return self.adapters.get(Platform.RELAY)
+        # A restored multiplexed source has no live transport-owner reference. Its persisted
+        # transport profile still identifies the adapter that received the lane; the source profile
+        # identifies the runtime/ledger and may be different (for example default bot -> SII).
+        from gateway.session_identity import identity_of
+        identity = identity_of(source) if source is not None else None
+        adapter_profile = (
+            identity.transport_profile
+            if identity is not None and identity.multiplexed and not identity.transport_inferred
+            else getattr(source, "profile", None)
+        )
         # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
         # shared-bot satellite; a disconnected secondary fails closed to ``{}``.
-        adapters = self._adapters_for_profile(getattr(source, "profile", None))
+        adapters = self._adapters_for_profile(adapter_profile)
         try:
             _transport = resolve_delivery_transport(Platform(platform_name), self.config, adapters)
         except Exception:
@@ -1569,12 +1579,14 @@ class GatewayNotificationsMixin:
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
-        if source is None or not getattr(source, "profile", None):
-            # No routed profile: the launch profile's own completion. Bind ITS scope once the
-            # process multiplexes — unscoped, a fail-closed ledger read raises on a legitimate
-            # launch-profile event (no-op while single-profile).
+        if source is None:
+            # No routable source: the launch profile's own completion. Bind ITS
+            # scope once the process multiplexes (no-op while single-profile).
             from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
             return async_launch_profile_scope_if_multiplexed()
+        # A persisted origin may predate profile-aware SessionSource records.
+        # Resolve it anyway: _resolve_profile_home_for_source can recover the
+        # owning profile from the route before falling back to the launch profile.
         profile_home = self._resolve_profile_home_for_source(source)
         if get_hermes_home_override() == str(profile_home):
             return contextlib.nullcontext()  # already inside this profile's scope

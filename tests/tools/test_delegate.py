@@ -851,6 +851,13 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
 
+    def test_model_without_route_is_rejected_instead_of_inheriting_parent_provider(self):
+        """A model ID is not portable across providers/endpoints."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "qwen38-27b-mtp-fullctx", "provider": "", "base_url": ""}
+        with self.assertRaisesRegex(ValueError, "complete delegation route"):
+            _resolve_delegation_credentials(cfg, parent)
+
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
         cfg = {

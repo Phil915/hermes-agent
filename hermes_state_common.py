@@ -560,6 +560,8 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     task_json TEXT,
     delivery_claim TEXT,
     delivery_claimed_at REAL,
+    last_delivery_claimed_at REAL,
+    delivery_recovery_reason TEXT,
     -- Mirrors the delegation tool's own CREATE TABLE (tools/async_delegation.py
     -- _initialize_schema). Keeping the canonical fresh-install shape identical
     -- to the tool's avoids a silent schema drift: the tool's lazy

@@ -23,11 +23,13 @@ _TASK_DICT_FIELDS = (
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
 )
 _SHOW_RUN_FIELDS = (
-    "id", "profile", "step_key", "status", "outcome", "summary", "error",
+    "id", "profile", "step_key", "status", "outcome", "terminal_result",
+    "exit_reason", "last_activity_at", "summary", "error",
     "metadata", "worker_pid", "started_at", "ended_at",
 )
 _RUNS_RUN_FIELDS = (
-    "id", "profile", "status", "outcome", "started_at", "ended_at",
+    "id", "profile", "status", "outcome", "terminal_result", "exit_reason",
+    "last_activity_at", "started_at", "ended_at",
     "summary", "error", "metadata", "worker_pid", "step_key",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
@@ -71,18 +73,21 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, observed_state: Optional[str] = None) -> str:
+    state = observed_state or t.status
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return f"{icon} {t.id}  {state:14s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return {k: getattr(obj, k) for k in fields}
 
 
-def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+def _task_to_dict(t: kb.Task, observed_state: Optional[str] = None) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
+    if observed_state is not None:
+        d["observed_execution_state"] = observed_state
     return d

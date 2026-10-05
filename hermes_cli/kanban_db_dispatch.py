@@ -17,6 +17,7 @@ import sys
 import time
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from typing import Callable
@@ -86,6 +87,176 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+
+class DeterministicRoutingError(RuntimeError):
+    """A role route is incomplete or internally inconsistent; retrying cannot heal it."""
+
+
+@dataclass(frozen=True)
+class DispatchRoute:
+    """Fully resolved execution route persisted on every dispatched run."""
+
+    role: str
+    profile: str
+    provider: str
+    endpoint: str
+    model: str
+    api_mode: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "role": self.role,
+            "profile": self.profile,
+            "provider": self.provider,
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "api_mode": self.api_mode,
+        }
+
+
+RouteResolver = Callable[["Task", str], DispatchRoute]
+
+
+_DETERMINISTIC_ROUTE_AUTH_CODES = frozenset({
+    "invalid_provider",
+    "missing_api_key",
+    "missing_base_url",
+    "missing_external_process_cli",
+    "no_aws_credentials",
+})
+_DETERMINISTIC_ROUTE_AUTH_PREFIXES = (
+    "No Anthropic credentials found.",
+    "No Azure Anthropic API key found.",
+    "Vertex AI credentials could not be resolved.",
+    "Azure Foundry requires an API key.",
+    "Azure Foundry requires a base URL.",
+)
+
+
+def _route_auth_error_is_deterministic(exc: Exception) -> bool:
+    """Classify only auth failures carrying terminal/configuration evidence.
+
+    ``AuthError.retryable=None`` is an unknown classification, not proof that a
+    later attempt cannot succeed.  Explicit retryability wins; otherwise a
+    relogin requirement or a route-configuration code is deterministic.
+    """
+    retryable = getattr(exc, "retryable", None)
+    if retryable is not None:
+        return not bool(retryable)
+    if bool(getattr(exc, "relogin_required", False)):
+        return True
+    if str(getattr(exc, "code", "") or "") in _DETERMINISTIC_ROUTE_AUTH_CODES:
+        return True
+    return str(exc).startswith(_DETERMINISTIC_ROUTE_AUTH_PREFIXES)
+
+
+def _resolve_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
+    """Resolve one role-owned profile route without cross-role inheritance.
+
+    Worker overrides belong only to the ready/worker lane.  A review execution
+    starts from the reviewer's profile configuration; the model/provider stored
+    on the product card are deliberately ignored.
+    """
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli.auth_constants import AuthError
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    profile = str(task.assignee or "").strip()
+    if not profile:
+        raise DeterministicRoutingError(f"{lane} route has no profile")
+    role = "developer_reviewer" if lane == "review" else "worker"
+    with _profile_runtime_scope(get_profile_dir(profile)):
+        config = load_config_readonly() or {}
+        model_cfg = config.get("model") or {}
+        if not isinstance(model_cfg, Mapping):
+            raise DeterministicRoutingError(f"{role} profile {profile!r} has no model configuration")
+        if lane == "review":
+            requested_model = str(model_cfg.get("default") or "").strip()
+            requested_provider = str(model_cfg.get("provider") or "").strip()
+        else:
+            requested_model = str(task.model_override or model_cfg.get("default") or "").strip()
+            requested_provider = str(task.provider_override or model_cfg.get("provider") or "").strip()
+        if not requested_model or not requested_provider:
+            raise DeterministicRoutingError(
+                f"{role} profile {profile!r} must resolve both provider and model"
+            )
+        try:
+            runtime = resolve_runtime_provider(
+                requested=requested_provider,
+                target_model=requested_model,
+            )
+        except AuthError as exc:
+            # Only explicit terminal/configuration evidence is sticky.  Legacy
+            # provider paths leave ``retryable`` unset for both terminal and
+            # transient failures, so None must remain recoverable.
+            if not _route_auth_error_is_deterministic(exc):
+                raise
+            raise DeterministicRoutingError(
+                f"{role} route {profile!r} -> {requested_provider!r} -> "
+                f"{requested_model!r} is invalid: {exc}"
+            ) from exc
+        except ValueError as exc:
+            # Disabled providers and malformed static configuration are
+            # deterministic. Transport, token-refresh, lock, and I/O errors are
+            # deliberately allowed to propagate for bounded retry.
+            raise DeterministicRoutingError(
+                f"{role} route {profile!r} -> {requested_provider!r} -> "
+                f"{requested_model!r} is invalid: {exc}"
+            ) from exc
+
+    provider = str(runtime.get("provider") or requested_provider).strip()
+    endpoint = str(runtime.get("base_url") or "").strip()
+    api_mode = str(runtime.get("api_mode") or "").strip()
+    missing = [
+        name for name, value in (
+            ("provider", provider), ("endpoint", endpoint),
+            ("model", requested_model), ("api_mode", api_mode),
+        ) if not value
+    ]
+    if missing:
+        raise DeterministicRoutingError(
+            f"{role} route for profile {profile!r} is incomplete: missing {', '.join(missing)}"
+        )
+    return DispatchRoute(
+        role=role,
+        profile=profile,
+        provider=provider,
+        endpoint=endpoint,
+        model=requested_model,
+        api_mode=api_mode,
+    )
+
+
+def _declared_dispatch_route(task: "Task", lane: str) -> DispatchRoute:
+    """Non-I/O route seam for custom spawn functions used by embedders/tests."""
+    role = "developer_reviewer" if lane == "review" else "worker"
+    review = lane == "review"
+    return DispatchRoute(
+        role=role,
+        profile=str(task.assignee or ""),
+        provider="profile-default" if review else str(task.provider_override or "profile-default"),
+        endpoint="profile-default",
+        model="profile-default" if review else str(task.model_override or "profile-default"),
+        api_mode="profile-default",
+    )
+
+
+def _record_dispatch_route(conn: sqlite3.Connection, task_id: str, route: DispatchRoute) -> None:
+    """Attach the immutable role route to the active execution record."""
+    run_id = _kb._current_run_id(conn, task_id)
+    if run_id is None:
+        return
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    metadata = _kb._json_dict(row["metadata"] if row else None)
+    metadata["dispatch_route"] = route.as_dict()
+    metadata["execution_id"] = run_id
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ? AND ended_at IS NULL",
+        (_kb._json_or_null(metadata), run_id),
+    )
 
 
 @dataclass
@@ -1139,18 +1310,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, "
+            "       t.started_at, t.assignee, r.started_at AS run_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
+            # Launch-window grace belongs to this execution, not the card's
+            # first-ever start.  A review/retry run must receive a fresh window.
+            started_at = _kb._row_get(row, "run_started_at")
+            if started_at is None:
+                started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
@@ -1527,7 +1702,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
@@ -1554,7 +1729,11 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and latest_outcome not in {"crashed", "route_resolution_failed"}
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1843,6 +2022,40 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def observed_execution_state(conn: sqlite3.Connection, task: "Task") -> str:
+    """Current execution state derived from durable run data and OS liveness.
+
+    This is reporting-only and performs no transition. The next bounded
+    dispatcher reconciliation pass owns recovery.
+    """
+    if task.status == "review" and task.current_run_id is None:
+        return "review_queued"
+    if task.status != "running":
+        return task.status
+    if task.current_run_id is None:
+        return "orphaned"
+    row = conn.execute(
+        "SELECT ended_at, worker_pid, worker_started_at, claim_lock, claim_expires, started_at "
+        "FROM task_runs WHERE id = ? AND task_id = ?",
+        (task.current_run_id, task.id),
+    ).fetchone()
+    if row is None or row["ended_at"] is not None:
+        return "orphaned"
+    pid = row["worker_pid"]
+    if pid is not None and str(row["claim_lock"] or "").startswith(_kb._host_prefix()):
+        if not _worker_alive(int(pid), _kb._row_get(row, "worker_started_at")):
+            started_at = _kb._row_get(row, "started_at")
+            if (
+                started_at is not None
+                and time.time() - int(started_at) < _kb._resolve_crash_grace_seconds()
+            ):
+                return "starting"
+            return "crashed"
+    if row["claim_expires"] is not None and int(row["claim_expires"]) < int(time.time()):
+        return "stale"
+    return "running" if pid is not None else "starting"
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1930,6 +2143,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    route_resolver: Optional[RouteResolver] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1953,6 +2167,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            route_resolver=route_resolver,
         )
 
     try:
@@ -2000,6 +2215,7 @@ def _dispatch_lane_task(
     board: Optional[str],
     failure_limit: int,
     spawn_fn,
+    route_resolver: Optional[RouteResolver],
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
@@ -2052,6 +2268,68 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+
+    # Resolve the complete role route for this execution before touching the
+    # workspace or spawning a process. Review runs never reuse card-level Worker
+    # overrides; they are projected from the reviewer's own profile instead.
+    resolver = route_resolver or (
+        _resolve_dispatch_route if spawn_fn is None else _declared_dispatch_route
+    )
+    try:
+        route = resolver(claimed, lane)
+        if not isinstance(route, DispatchRoute):
+            raise DeterministicRoutingError("route resolver returned no DispatchRoute")
+        if route.profile != (claimed.assignee or ""):
+            raise DeterministicRoutingError(
+                f"resolved profile {route.profile!r} does not match assignee {claimed.assignee!r}"
+            )
+        dispatched = replace(
+            claimed,
+            # A custom spawn seam without an explicit route resolver delegates
+            # to the reviewer's profile defaults; never forward card-level
+            # Worker overrides across the role boundary.
+            provider_override=(
+                None if lane == "review" and route.provider == "profile-default"
+                else route.provider
+            ),
+            model_override=(
+                None if lane == "review" and route.model == "profile-default"
+                else route.model
+            ),
+        )
+        with _kb.write_txn(conn):
+            _record_dispatch_route(conn, claimed.id, route)
+    except DeterministicRoutingError as exc:
+        error = f"deterministic routing failure for {lane}: {exc}"
+        if _record_task_failure(
+            conn,
+            claimed.id,
+            error,
+            outcome="route_failed",
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"routing_failure": True, "lane": lane, "deterministic": True},
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    except Exception as exc:
+        # Resolution can touch OAuth refresh, filesystem locks, and provider
+        # metadata. Those failures are recoverable and spend only the bounded
+        # retry budget; they must not create a sticky operator block.
+        error = f"transient route resolution failure for {lane}: {exc}"
+        if _record_task_failure(
+            conn,
+            claimed.id,
+            error,
+            outcome="route_resolution_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"routing_failure": True, "lane": lane, "deterministic": False},
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2072,9 +2350,14 @@ def _dispatch_lane_task(
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        dispatched.skills = list(dict.fromkeys([*(dispatched.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            dispatched,
+            str(workspace),
+            board,
+        )
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2292,6 +2575,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    route_resolver: Optional[RouteResolver] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2346,6 +2630,7 @@ def _dispatch_once_locked(
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
+        route_resolver=route_resolver,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)

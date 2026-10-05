@@ -6,6 +6,7 @@ tests produce the orphan with a real owner process against a real temp ``state.d
 (``now=``) or written into the row, never raced against the wall clock.
 """
 
+import json
 import os
 import queue
 import sqlite3
@@ -55,6 +56,21 @@ def _orphan(home: Path) -> str:
     out = subprocess.run([sys.executable, "-c", _OWNER], cwd=REPO, env=env, text=True,
                          capture_output=True, timeout=60, check=True)
     return out.stdout.strip().splitlines()[-1]
+
+
+def _live_owner_completion(home: Path) -> str:
+    """Complete normally in this still-live process without consuming delivery."""
+    home.mkdir(parents=True, exist_ok=True)
+    with _Home(home):
+        handle = ad.dispatch_async_delegation(
+            goal="live owner", context=None, toolsets=None, role="leaf", model="m",
+            session_key="live-parent", parent_session_id="parent-session",
+            runner=lambda: {"status": "completed", "summary": "done"},
+        )
+        deadline = time.monotonic() + 10
+        while ad.active_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+    return handle["delegation_id"]
 
 
 def _row(home: Path, delegation_id: str) -> dict:
@@ -123,21 +139,119 @@ def test_orphaned_terminal_completion_is_offered_once_while_the_process_runs(tmp
     assert _row(home, delegation_id)["delivery_state"] == "delivered"
 
 
-def test_row_owned_by_a_live_process_is_never_swept(tmp_path):
+def test_aged_pending_completion_is_recovered_while_owner_remains_alive(tmp_path):
     home = tmp_path / "home"
-    home.mkdir()
+    delegation_id = _live_owner_completion(home)
+    row = _row(home, delegation_id)
+    assert row["owner_pid"] == os.getpid() and row["delivery_state"] == "pending"
     q = queue.Queue()
     with _Home(home):
-        handle = ad.dispatch_async_delegation(
-            goal="mine", context=None, toolsets=None, role="leaf", model="m", session_key="live",
-            runner=lambda: {"status": "completed", "summary": "done"})
-        deadline = time.monotonic() + 10
-        while ad.active_count() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        row = _row(home, handle["delegation_id"])
-        assert row["owner_pid"] == os.getpid() and row["delivery_state"] == "pending"
-        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 3600) == 0
+        # Preserve the normal immediate-delivery window.
+        assert ad.sweep_orphaned_completions(q, now=row["completed_at"] + 1) == 0
+        later = row["completed_at"] + ad._PENDING_DELIVERY_GRACE_S + 1
+        assert ad.sweep_orphaned_completions(q, now=later) == 1
+        (evt,) = _drain(q)
+        assert evt["delegation_id"] == delegation_id
+        assert evt["delivery_recovery_reason"] == "aged_pending_live_owner"
+        claim = ad.claim_event_delivery(evt, "parent")
+        assert claim and ad.complete_event_delivery(evt, claim) is None
+    recovered = _row(home, delegation_id)
+    assert recovered["delivery_state"] == "delivered"
+    assert recovered["delivery_attempts"] == 1
+    assert recovered["delivery_claimed_at"] is None
+    assert recovered["last_delivery_claimed_at"] is not None
+    assert recovered["delivered_at"] is not None
+    assert recovered["delivery_recovery_reason"] == "aged_pending_live_owner"
+
+
+def test_normal_delivery_before_grace_is_not_recovered(tmp_path):
+    home = tmp_path / "home"
+    delegation_id = _live_owner_completion(home)
+    row = _row(home, delegation_id)
+    evt = json.loads(row["event_json"])
+    q = queue.Queue()
+    with _Home(home):
+        claim = ad.claim_event_delivery(evt, "normal")
+        assert claim
+        ad.complete_event_delivery(evt, claim)
+        assert ad.sweep_orphaned_completions(
+            q, now=row["completed_at"] + ad._PENDING_DELIVERY_GRACE_S + 1,
+        ) == 0
     assert q.empty()
+    assert _row(home, delegation_id)["delivery_recovery_reason"] is None
+
+
+def test_two_aged_pending_recovery_workers_process_once(tmp_path):
+    home = tmp_path / "home"
+    delegation_id = _live_owner_completion(home)
+    row = _row(home, delegation_id)
+    later = row["completed_at"] + ad._PENDING_DELIVERY_GRACE_S + 1
+    q = queue.Queue()
+    counts = []
+
+    def recover():
+        with _Home(home):
+            counts.append(ad.sweep_orphaned_completions(q, now=later))
+
+    threads = [threading.Thread(target=recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    with _Home(home):
+        assert sum(counts) == 1
+        (evt,) = _drain(q)
+        first = ad.claim_event_delivery(evt, "first")
+        assert first
+        assert ad.claim_event_delivery(evt, "second") is None
+        ad.complete_event_delivery(evt, first)
+    assert _row(home, delegation_id)["delivery_attempts"] == 1
+
+
+def test_stale_delivery_claim_is_reclaimed_for_aged_live_owner(tmp_path):
+    home = tmp_path / "home"
+    delegation_id = _live_owner_completion(home)
+    row = _row(home, delegation_id)
+    later = row["completed_at"] + ad._PENDING_DELIVERY_GRACE_S + 1
+    _set(
+        home, delegation_id,
+        delivery_claim="stalled-consumer",
+        delivery_claimed_at=time.time() - ad._CLAIM_LEASE_S - 1,
+    )
+    q = queue.Queue()
+    with _Home(home):
+        assert ad.sweep_orphaned_completions(q, now=later) == 1
+        (evt,) = _drain(q)
+        claim = ad.claim_event_delivery(evt, "recovery")
+        assert claim
+        ad.complete_event_delivery(evt, claim)
+    assert _row(home, delegation_id)["delivery_state"] == "delivered"
+
+
+def test_unavailable_parent_releases_aged_completion_for_later_retry(tmp_path):
+    home = tmp_path / "home"
+    delegation_id = _live_owner_completion(home)
+    row = _row(home, delegation_id)
+    later = row["completed_at"] + ad._PENDING_DELIVERY_GRACE_S + 1
+    q = queue.Queue()
+    with _Home(home):
+        assert ad.sweep_orphaned_completions(q, now=later) == 1
+        (evt,) = _drain(q)
+        claim = ad.claim_event_delivery(evt, "unavailable-parent")
+        assert claim
+        assert ad.release_completion_delivery(delegation_id, claim)
+        ad.return_completion_offer(evt)
+        pending = _row(home, delegation_id)
+        assert pending["delivery_state"] == "pending"
+        assert pending["delivery_attempts"] == 1
+        assert pending["event_json"] and pending["result_json"]
+        retry_at = pending["updated_at"] + ad._PENDING_DELIVERY_GRACE_S + 1
+        assert ad.sweep_orphaned_completions(q, now=retry_at) == 1
+        (retry_evt,) = _drain(q)
+        retry_claim = ad.claim_event_delivery(retry_evt, "parent-back")
+        assert retry_claim
+        ad.complete_event_delivery(retry_evt, retry_claim)
+    assert _row(home, delegation_id)["delivery_state"] == "delivered"
 
 
 def test_sweep_is_bound_to_the_profile_home_it_runs_under(tmp_path):
