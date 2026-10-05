@@ -153,3 +153,103 @@ def test_exhausted_interrupted_wait_does_not_fail_the_paused_card(tmp_path, monk
         assert task.current_run_id == run_id
         assert task.consecutive_failures == 0
         assert kb.latest_run(conn, task_id).ended_at is None
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_direction_wait_excludes_liveness_until_answer_or_interrupt(tmp_path, monkeypatch, interrupted):
+    from agent import activity_tracking, turn_liveness
+    from agent.tool_executor import execute_tool_calls_sequential
+    from agent.turn_facade_lease import DurableTurnLease
+
+    agent = _make_agent(tmp_path)
+    agent.valid_tool_names.add("kanban_needs_direction")
+    clock = [1000.0]
+    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
+    monkeypatch.setattr(activity_tracking, "time", fake_time)
+    monkeypatch.setattr(turn_liveness, "time", fake_time)
+    lease = DurableTurnLease(agent, Mock(), "worker-session", "lease-holder")
+    lease.turn_active = True
+    watchdog = turn_liveness.TurnLivenessWatchdog(
+        agent, session_id="worker-session", timeout_s=10, poll_s=1,
+        stop_event=lease.stop, activity_lock=agent._liveness_activity_lock(),
+        is_turn_active=lease.is_turn_active, commit_abort=lease.commit_liveness_abort,
+        deactivate_turn=lease.stop_refresher,
+    )
+    agent._touch_activity("before direction")
+    old_snapshot = watchdog._sample()
+
+    def dispatch(*_, **__):
+        # A configured timeout shorter than the generic 30-second heartbeat
+        # must not terminate a healthy decision wait, however long it lasts.
+        for elapsed in (15, 3600):
+            clock[0] += elapsed
+            assert watchdog._tick() is None
+            assert not agent._interrupt_requested
+            assert lease.is_turn_active()
+        assert not lease.commit_liveness_abort(old_snapshot, "stale pre-pause observation")
+        if interrupted:
+            agent.interrupt("operator stop", hard_cancel=True)
+        return json.dumps({"ok": True, "status": "needs_direction" if interrupted else "running"})
+
+    monkeypatch.setattr("model_tools.handle_function_call", dispatch)
+    messages = []
+    try:
+        execute_tool_calls_sequential(
+            agent, SimpleNamespace(tool_calls=[_call("kanban_needs_direction", "ask")]),
+            messages, "worker-session",
+        )
+        assert json.loads(messages[-1]["content"])["ok"] is True
+        agent.clear_interrupt()
+        # Exiting the wait starts a fresh inactivity window; it does not
+        # permanently disable the watchdog or charge the preceding pause.
+        assert watchdog._sample().idle_seconds == 0
+        assert watchdog._tick() is None
+        clock[0] += 11
+        assert watchdog._tick() is False
+        assert agent._interrupt_requested
+        assert not lease.is_turn_active()
+    finally:
+        agent.clear_interrupt()
+        if agent._session_db is not None:
+            agent._session_db.close()
+
+
+def test_other_tool_waits_still_obey_turn_liveness(tmp_path, monkeypatch):
+    from agent import activity_tracking, turn_liveness
+    from agent.tool_executor import execute_tool_calls_sequential
+    from agent.turn_facade_lease import DurableTurnLease
+
+    agent = _make_agent(tmp_path)
+    clock = [1000.0]
+    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
+    monkeypatch.setattr(activity_tracking, "time", fake_time)
+    monkeypatch.setattr(turn_liveness, "time", fake_time)
+    lease = DurableTurnLease(agent, Mock(), "worker-session", "lease-holder")
+    lease.turn_active = True
+    watchdog = turn_liveness.TurnLivenessWatchdog(
+        agent, session_id="worker-session", timeout_s=10, poll_s=1,
+        stop_event=lease.stop, activity_lock=agent._liveness_activity_lock(),
+        is_turn_active=lease.is_turn_active, commit_abort=lease.commit_liveness_abort,
+        deactivate_turn=lease.stop_refresher,
+    )
+    agent._touch_activity("before ordinary tool")
+
+    def dispatch(*_, **__):
+        clock[0] += 15
+        assert watchdog._tick() is False
+        assert agent._interrupt_requested
+        assert not lease.is_turn_active()
+        return "interrupted ordinary tool"
+
+    monkeypatch.setattr("model_tools.handle_function_call", dispatch)
+    try:
+        execute_tool_calls_sequential(
+            agent, SimpleNamespace(tool_calls=[_call("web_extract", "ordinary")]),
+            [], "worker-session",
+        )
+        assert agent._interrupt_requested
+        assert not lease.is_turn_active()
+    finally:
+        agent.clear_interrupt()
+        if agent._session_db is not None:
+            agent._session_db.close()

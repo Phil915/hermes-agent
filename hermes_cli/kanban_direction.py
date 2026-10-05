@@ -139,9 +139,13 @@ def request_direction(conn, task_id: str, *, expected_run_id: int,
         if len(owners) != 1:
             raise ValueError("direction requires exactly one existing wake-capable coordinator subscription")
         owner = session_identity(owners[0])
+        if owner["platform"].lower() == "tui":
+            raise ValueError("TUI subscriptions cannot wake a coordinator for developer questions")
         # Stateless API subscriptions name the owning raw session directly;
         # child cards can retain a different creator/Worker session as provenance.
         owner_session_id = owner["chat_id"] if owner["platform"] == "api_server" else task.session_id
+        if not isinstance(owner_session_id, str) or not owner_session_id.strip():
+            raise ValueError("direction requires a persisted coordinator session identity")
         now, question_id = int(time.time()), "dir_" + uuid.uuid4().hex[:16]
         conn.execute(
             "INSERT INTO developer_questions (id, task_id, run_id, worker_session_id, owner_profile, "
@@ -163,10 +167,10 @@ def request_direction(conn, task_id: str, *, expected_run_id: int,
 
 def _owner_session_matches(owner_id: str | None, responder_id: str | None) -> bool:
     """Compression continues the same coordinator; a branch or new chat does not."""
-    if not owner_id or owner_id == responder_id:
-        return True
-    if not responder_id:
+    if not all(isinstance(value, str) and value.strip() for value in (owner_id, responder_id)):
         return False
+    if owner_id == responder_id:
+        return True
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB
     db = None
@@ -258,6 +262,40 @@ def direction_context(conn, task_id: str) -> str:
     return "\n\n## Developer direction (same card/run)\n" + json.dumps({
         "question_id": row["id"], "question": row["question"], "response": row["response"],
     }, ensure_ascii=False)
+
+
+def goal_progress(conn, task_id: str, run_id: int | None) -> dict:
+    """Recover the already charged goal turn when a paused process is restored."""
+    from hermes_cli import kanban_db as kb
+
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+                       (run_id, task_id)).fetchone()
+    progress = kb._json_dict(row["metadata"]).get("kanban_goal_progress", {}) if row else {}
+    if not progress:
+        return {}
+    if (not isinstance(progress, dict) or set(progress) != {"turns_used", "nudged_to_finalize"}
+            or type(progress["turns_used"]) is not int or progress["turns_used"] < 1
+            or type(progress["nudged_to_finalize"]) is not bool):
+        raise ValueError("invalid durable Kanban goal progress; refusing to reset its budget")
+    return progress
+
+
+def checkpoint_goal_progress(conn, task_id: str, run_id: int, progress: dict) -> None:
+    """Charge a goal continuation before it runs, preserving all other run metadata."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT r.metadata FROM task_runs r JOIN tasks t ON t.current_run_id = r.id "
+            "WHERE t.id = ? AND r.task_id = t.id AND r.id = ? "
+            "AND t.status = 'running' AND r.ended_at IS NULL", (task_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("goal continuation requires the current open Worker run")
+        metadata = kb._json_dict(row["metadata"])
+        metadata["kanban_goal_progress"] = dict(progress)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps(metadata), run_id))
 
 
 def paused_worker_counts(conn) -> dict[str, int]:

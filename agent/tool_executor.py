@@ -1733,13 +1733,18 @@ def _run_sequential_call(
     before re-raising so the tool-call turn keeps matching results (alternation)."""
     _spinner_result = None
     try:
-        managed = _run_sequential_tool_execution_middleware(
-            agent,
-            **dict(ref.middleware_kwargs(), middleware_trace=dispatch.middleware_trace_arg),
-            execute=dispatch.execute,
-            scope_block=scope_block,
-            display_index=display_index,
-        )
+        from agent.turn_liveness import direction_wait_liveness
+
+        liveness_scope = (direction_wait_liveness(agent) if ref.name == "kanban_needs_direction"
+                          else contextlib.nullcontext())
+        with liveness_scope:
+            managed = _run_sequential_tool_execution_middleware(
+                agent,
+                **dict(ref.middleware_kwargs(), middleware_trace=dispatch.middleware_trace_arg),
+                execute=dispatch.execute,
+                scope_block=scope_block,
+                display_index=display_index,
+            )
         ref.args = managed.args
         _spinner_result = managed.result
     except KeyboardInterrupt:

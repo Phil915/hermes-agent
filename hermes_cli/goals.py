@@ -1603,13 +1603,16 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    initial_progress: Optional[Dict[str, Any]] = None,
+    checkpoint_progress=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
     Each iteration: stop if the worker already terminated the task (``kanban_complete`` /
     ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
     (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
-    as CONTINUE (workers finish via kanban tools, not by parking).
+    as CONTINUE (workers finish via kanban tools, not by parking). The CLI checkpoints
+    each charged continuation so direction recovery can resume the same goal budget.
     """
 
     def _log(msg: str) -> None:
@@ -1633,8 +1636,9 @@ def run_kanban_goal_loop(
         max_turns = DEFAULT_MAX_TURNS
 
     last_response = first_response or ""
-    turns_used = 1   # the first turn already consumed one unit of budget
-    nudged_to_finalize = False
+    progress = initial_progress or {}
+    turns_used = progress.get("turns_used", 1)  # a restored turn was already charged
+    nudged_to_finalize = progress.get("nudged_to_finalize", False)
 
     while True:
         try:
@@ -1699,6 +1703,9 @@ def run_kanban_goal_loop(
             return _result("blocked_budget", "turn budget exhausted")
 
         try:
+            if checkpoint_progress is not None:
+                checkpoint_progress({"turns_used": turns_used + 1,
+                                     "nudged_to_finalize": nudged_to_finalize})
             last_response = run_turn(prompt) or ""
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")

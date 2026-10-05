@@ -11,6 +11,42 @@ from hermes_cli.kanban_direction import answer_direction, request_direction
 from tools.kanban_tools import _resolve_notify_target
 
 
+@pytest.mark.parametrize(("platform", "owner_session_id", "error"), [
+    ("discord", None, "coordinator session identity"),
+    ("discord", "", "coordinator session identity"),
+    ("discord", "   ", "coordinator session identity"),
+    ("tui", "owner-session", "TUI subscriptions cannot wake"),
+])
+def test_unbound_or_unsupported_owner_cannot_pause_worker(
+        tmp_path, monkeypatch, platform, owner_session_id, error):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="Existing activity", assignee="worker",
+                                 session_id=owner_session_id)
+        kbn.add_notify_sub(conn, task_id=task_id, platform=platform, chat_id="owner-chat",
+                           notifier_profile="developer", delivery_mode="wake")
+        task = kb.claim_task(conn, task_id)
+        task_before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        run_before = dict(conn.execute("SELECT * FROM task_runs WHERE id = ?",
+                                       (task.current_run_id,)).fetchone())
+        events_before = kb.list_events(conn, task_id)
+        with pytest.raises(ValueError, match=error):
+            request_direction(conn, task_id, expected_run_id=task.current_run_id,
+                              worker_session_id="worker-session", question={
+                                  "question": "Which conflicting canon provision governs the migration?",
+                                  "why_it_matters": "The public interface depends on the decision.",
+                                  "evidence": {"references": ["canon/v1", "canon/v2"],
+                                               "precedent_status": "conflicting"},
+                                  "options": ["Keep v1", "Approve v2"],
+                                  "decision_needed": "canon_interpretation"})
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == task_before
+        assert dict(conn.execute("SELECT * FROM task_runs WHERE id = ?",
+                                 (task.current_run_id,)).fetchone()) == run_before
+        assert kb.list_events(conn, task_id) == events_before
+        assert conn.execute("SELECT COUNT(*) FROM developer_questions").fetchone()[0] == 0
+
+
 def test_restored_owner_scope_alias_accepts_its_response_only(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -55,6 +91,22 @@ def test_restored_owner_scope_alias_accepts_its_response_only(tmp_path, monkeypa
             with pytest.raises(ValueError, match="owning coordinator session"):
                 answer_direction(conn, task_id, record["id"], responder_profile="developer",
                                  responder_session=wrong, response=response)
+        # Neither a missing responder identity nor an older unbound question
+        # grants authority to a replacement session on the same route.
+        for missing in (None, "", "   "):
+            with pytest.raises(ValueError, match="owning coordinator session"):
+                answer_direction(conn, task_id, record["id"], responder_profile="developer",
+                                 responder_session={**responder, "session_id": missing}, response=response)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE developer_questions SET owner_session_id = ? WHERE id = ?",
+                             (missing, record["id"]))
+            with pytest.raises(ValueError, match="owning coordinator session"):
+                answer_direction(conn, task_id, record["id"], responder_profile="developer",
+                                 responder_session={**responder, "session_id": "replacement-session"},
+                                 response=response)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE developer_questions SET owner_session_id = ? WHERE id = ?",
+                             ("owner-session", record["id"]))
         answered = answer_direction(conn, task_id, record["id"], responder_profile="developer",
                                     responder_session=responder, response=response)
         assert answered["response"] == response

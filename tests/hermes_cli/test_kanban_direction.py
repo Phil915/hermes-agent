@@ -161,10 +161,25 @@ def test_unavailable_worker_history_stays_paused_without_replacement(
 
 
 def _admit(launch):
-    from hermes_cli.kanban_direction_admission import admit_direction_resume_from_env
+    from hermes_cli.kanban_direction_admission import (
+        admit_prepared_direction_resume, prepare_direction_resume_from_env,
+    )
+    from hermes_state import SessionDB
 
     with patch.dict(os.environ, launch["env"], clear=True):
-        return admit_direction_resume_from_env(worker_session_id="original-worker-session")
+        admission = prepare_direction_resume_from_env(worker_session_id="original-worker-session")
+        if admission is False:
+            return False
+        db = SessionDB(Path(launch["env"]["HERMES_HOME"]) / "state.db", read_only=True)
+        try:
+            history = db.get_messages_as_conversation("original-worker-session", repair_alternation=True)
+        finally:
+            db.close()
+        return admit_prepared_direction_resume(
+            SimpleNamespace(_direction_resume_admission=admission,
+                            session_id="original-worker-session", agent=object()),
+            conversation_history=history,
+        )
 
 
 def test_two_durable_pauses_exclude_waiting_from_watchdogs_and_runtime(

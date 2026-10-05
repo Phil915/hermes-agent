@@ -67,11 +67,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli.kanban_direction import checkpoint_goal_progress, goal_progress
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
     # Goal text = title + body (the acceptance criteria the judge evaluates against).
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
+        progress = goal_progress(conn, task_id, worker_run_id)
     if task is None:
         return
 
@@ -95,11 +97,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         with _kbc.connect_closing() as c:
             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
 
+    def _checkpoint(progress: dict) -> None:
+        with _kbc.connect_closing() as c:
+            checkpoint_goal_progress(c, task_id, worker_run_id, progress)
+
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
         task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=log or (lambda m: logger.info("%s", m)),
+        initial_progress=progress,
+        checkpoint_progress=_checkpoint if worker_run_id is not None else None,
     )
 
 
@@ -200,6 +208,9 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
+        from hermes_cli.kanban_direction_admission import admit_prepared_direction_resume
+        if not admit_prepared_direction_resume(cli, conversation_history=cli.conversation_history):
+            exit_single_query(0)
         try:
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
@@ -434,10 +445,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
     ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
     from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive, _single_query_exit_code
-    from hermes_cli.kanban_direction_admission import admit_direction_resume_from_env
-    if not admit_direction_resume_from_env(worker_session_id=getattr(cli, "session_id", "") or ""):
+    from hermes_cli.kanban_direction_admission import prepare_direction_resume_from_env
+    admission = prepare_direction_resume_from_env(worker_session_id=getattr(cli, "session_id", "") or "")
+    if admission is False:
         from hermes_cli.quiet_single_query import exit_single_query
         exit_single_query(0)
+    cli._direction_resume_admission = admission
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(
@@ -504,6 +517,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
         response = cli.chat(query, images=single_query_images or None)
+        if getattr(cli, "_direction_resume_admission", None) is not None:
+            # Startup or final admission refused this launch. In particular a
+            # duplicate must not enter the goal judge and mutate the accepted run.
+            exit_single_query(0)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).

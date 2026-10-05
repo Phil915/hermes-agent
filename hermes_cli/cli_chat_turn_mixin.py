@@ -349,6 +349,11 @@ class CLIChatTurnMixin:
             from agent.notification_presentation import notification_turn
             muted = getattr(turn, "mute_notification_reply", False)
             with notification_turn(self.agent, muted=muted, session_id=self.session_id):
+                from hermes_cli.kanban_direction_admission import admit_prepared_direction_resume
+                if not admit_prepared_direction_resume(self, conversation_history=self.conversation_history[:-1]):
+                    turn.result = {"completed": False, "final_response": "",
+                                   "error": "Direction resume was not admitted; the Worker remains paused."}
+                    return
                 turn.result = self.agent.run_conversation(
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],

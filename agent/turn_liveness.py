@@ -14,6 +14,7 @@ import logging
 import math
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,29 @@ class ActivitySnapshot(NamedTuple):
     generation: int
     activity_ts: Optional[float]
     idle_seconds: float
+
+
+@contextmanager
+def direction_wait_liveness(agent):
+    """A coordinator decision is a pause, even below the tool heartbeat interval."""
+    with agent._liveness_activity_lock():
+        agent._kanban_direction_waiting = True
+        # Invalidate a stall sampled before this pause, including an abort
+        # already reserved by the watchdog's generation-qualified interrupt.
+        agent._turn_liveness_activity_generation = (
+            getattr(agent, "_turn_liveness_activity_generation", 0) + 1
+        )
+        agent._turn_liveness_abort_claim = None
+    try:
+        yield
+    finally:
+        try:
+            # Reset the origin before removing the exemption, also on interrupt
+            # or tool failure. A late tick must not charge the paused interval.
+            agent._touch_activity("kanban direction wait ended")
+        finally:
+            with agent._liveness_activity_lock():
+                agent._kanban_direction_waiting = False
 
 
 def _warn_invalid_value(key: str, raw: Any, default: float) -> None:
@@ -147,7 +171,8 @@ class TurnLivenessWatchdog:
                 return None
             generation = getattr(self._agent, "_turn_liveness_activity_generation", 0)
             activity_ts = getattr(self._agent, "_last_activity_ts", None)
-        idle_seconds = 0.0 if activity_ts is None else max(0.0, time.time() - activity_ts)
+            direction_waiting = getattr(self._agent, "_kanban_direction_waiting", False)
+        idle_seconds = 0.0 if activity_ts is None or direction_waiting else max(0.0, time.time() - activity_ts)
         return ActivitySnapshot(generation, activity_ts, idle_seconds)
 
     def _emit_warning(self, text: str, debug_msg: str) -> None:
