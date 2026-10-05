@@ -76,6 +76,80 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+def test_durable_session_identity_crosses_child_bridge_without_ambient_fallback(tmp_path, monkeypatch):
+    """A cached turn binds its resolved conversation, including across profile switches."""
+    import json
+    import subprocess
+    import sys
+
+    import hermes_state
+    from gateway.config import GatewayConfig
+    from gateway.run import _profile_runtime_scope
+    from gateway.session import SessionStore, build_session_context
+    from tools.environments.local import build_subprocess_env
+
+    home = tmp_path / "hermes"
+    homes = {name: home / "profiles" / name for name in ("developer-a", "developer-b")}
+    for profile_home in homes.values():
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-process-mirror")
+    # Exercise production profile resolution instead of the suite's fixed DB path.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    config = GatewayConfig(multiplex_profiles=True)
+    sources = {name: SessionSource(platform=Platform.DISCORD, chat_id="same-channel",
+                                   chat_type="group", user_id="same-user", scope_id="guild",
+                                   profile=name) for name in homes}
+    store = SessionStore(home / "sessions", config)
+    entries = {}
+    try:
+        for name, profile_home in homes.items():
+            with _profile_runtime_scope(profile_home):
+                entries[name] = store.get_or_create_session(sources[name])
+                assert store._db.get_session(entries[name].session_id)
+    finally:
+        store.close_all_db_handles()
+    assert entries["developer-a"].session_id != entries["developer-b"].session_id
+
+    # Restore from persisted routing state; no agent constructor republishes an ID.
+    store = SessionStore(home / "sessions", config)
+    runner = object.__new__(GatewayRunner)
+    names = ("HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_PROFILE", "HERMES_HOME")
+    probe = "import json,os; print(json.dumps({k:os.environ.get(k) for k in " + repr(names) + "}))"
+    try:
+        for name in ("developer-a", "developer-b", "developer-a"):
+            with _profile_runtime_scope(homes[name]):
+                entry = store.lookup_by_session_key(entries[name].session_key)
+                assert entry.session_id == entries[name].session_id
+                context = build_session_context(sources[name], config, entry)
+                tokens = runner._set_session_env(context)
+                try:
+                    child = subprocess.run([sys.executable, "-c", probe], env=build_subprocess_env(),
+                                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                           check=True, timeout=30)
+                    assert json.loads(child.stdout) == dict(zip(names, (
+                        entry.session_id, entry.session_key, name, str(homes[name]))))
+                    assert os.environ["HERMES_SESSION_ID"] == "foreign-process-mirror"
+                    assert os.environ["HERMES_HOME"] == str(home)
+                finally:
+                    runner._clear_session_env(tokens)
+
+        # Pre-resolution contexts intentionally lack authority, even with a stale mirror.
+        context = build_session_context(sources["developer-a"], config)
+        tokens = runner._set_session_env(context)
+        try:
+            child = subprocess.run([sys.executable, "-c", probe], env=build_subprocess_env(),
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   check=True, timeout=30)
+            assert json.loads(child.stdout)["HERMES_SESSION_ID"] == ""
+            assert get_session_env("HERMES_SESSION_ID") == ""
+        finally:
+            runner._clear_session_env(tokens)
+    finally:
+        store.close_all_db_handles()
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)
